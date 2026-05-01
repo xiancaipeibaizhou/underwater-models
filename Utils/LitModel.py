@@ -14,7 +14,7 @@ from torchmetrics import F1Score
 from src.models.custom_model import HP_STGNN
 from src.models.uatr_knn_reg import AcousticAuxTargetExtractor, UATR_KNN_REG
 from src.models.uatr_knn_graph import UATR_KNN_Graph  # 🌟 新增：导入轻量化模型
-from src.models.fa_uatr_knn import FA_UATR_KNN
+from src.models.fa_uatr_knn import FA_UATR_KNN, FA_UATR_KNN_V2
 from src.models.shufflefac import ShuffleFAC
 from src.models.stereo_semantic_net import KnowledgeUpdateStereoSemanticNet
 from src.models.multifeature_fusion import (
@@ -196,6 +196,25 @@ class LitModel(L.LightningModule):
                 n_mels=Params.get('number_mels', 128),
             )
 
+        elif self.model_name == 'FA_UATR_KNN_V2':
+            print("Loading FA_UATR_KNN_V2 diagnostic model")
+            self.model = FA_UATR_KNN_V2(
+                num_classes=self.num_classes,
+                in_channels=1,
+                dim=Params.get('fusion_dim', 128),
+                k=Params.get('knn_k', 8),
+                depth=Params.get('uatr_depth', 1),
+                dropout=Params.get('dropout', 0.2),
+                n_mels=Params.get('number_mels', 128),
+                fa_target_freq=Params.get('fa_target_freq', 4),
+                fa_arch=Params.get('fa_arch', 'parallel'),
+                pos_type=Params.get('pos_type', '2d'),
+                knn_metric=Params.get('knn_metric', 'cosine'),
+                knn_source=Params.get('knn_source', 'pre_trans'),
+                gate_type=Params.get('gate_type', 'token'),
+                gate_init_bias=Params.get('gate_init_bias', -2.0),
+            )
+
         elif self.model_name == 'StereoSemanticNet':
             print("🔥 加载基于知识嵌入的立体语义网络 (StereoSemanticNet)")
             self.model = KnowledgeUpdateStereoSemanticNet(
@@ -281,7 +300,7 @@ class LitModel(L.LightningModule):
             )
                
         else:
-            raise ValueError(f"Unsupported model: {model_name}. Please use HTAN, UATR_KNN, ShuffleFAC, FA_UATR_KNN, StereoSemanticNet, or MF_* models.")
+            raise ValueError(f"Unsupported model: {model_name}. Please use HTAN, UATR_KNN, ShuffleFAC, FA_UATR_KNN, FA_UATR_KNN_V2, StereoSemanticNet, or MF_* models.")
 
         self.criterion = nn.CrossEntropyLoss()
         self.aux_target_extractor = getattr(self, "aux_target_extractor", None)

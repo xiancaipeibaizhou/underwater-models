@@ -351,6 +351,13 @@ def main(Params):
             "fusion_dropout": Params.get('fusion_dropout', 0.2),
             "knn_k": Params.get('knn_k', 8),
             "uatr_depth": Params.get('uatr_depth', 1),
+            "fa_target_freq": Params.get('fa_target_freq', 4),
+            "fa_arch": Params.get('fa_arch', 'parallel'),
+            "pos_type": Params.get('pos_type', '2d'),
+            "knn_metric": Params.get('knn_metric', 'cosine'),
+            "knn_source": Params.get('knn_source', 'pre_trans'),
+            "gate_type": Params.get('gate_type', 'token'),
+            "gate_init_bias": Params.get('gate_init_bias', -2.0),
         }
         with open(os.path.join(save_dir, "model_config.json"), "w", encoding="utf-8") as f:
             json.dump(model_config, f, indent=2)
@@ -502,6 +509,13 @@ def parse_args():
     parser.add_argument('--fusion_dropout', type=float, default=0.2)
     parser.add_argument('--knn_k', type=int, default=8)
     parser.add_argument('--uatr_depth', type=int, default=1)
+    parser.add_argument('--fa_target_freq', type=int, default=4, choices=[1, 4, 8])
+    parser.add_argument('--fa_arch', type=str, default='parallel', choices=['serial', 'parallel'])
+    parser.add_argument('--pos_type', type=str, default='2d', choices=['1d', '2d'])
+    parser.add_argument('--knn_metric', type=str, default='cosine', choices=['l2', 'cosine'])
+    parser.add_argument('--knn_source', type=str, default='pre_trans', choices=['pre_trans', 'post_trans'])
+    parser.add_argument('--gate_type', type=str, default='token', choices=['scalar', 'token', 'element'])
+    parser.add_argument('--gate_init_bias', type=float, default=-2.0)
 
     parser.add_argument('--test_snr', type=float, default=None, help='测试集注入的 SNR (dB)')
     # test_only 模式用于服务器上加载已有 ckpt 做鲁棒性/噪声测试，不触发训练。

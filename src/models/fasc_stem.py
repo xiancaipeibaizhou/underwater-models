@@ -26,10 +26,19 @@ class FASCStem(nn.Module):
         activation="glu",
         dropout=0.2,
         filters=None,
+        target_freq=1,
     ):
         super().__init__()
+        if target_freq not in (1, 4, 8):
+            raise ValueError("target_freq must be one of {1, 4, 8}.")
         filters = filters or [16, 32, 64, 128, 128, 128, 128]
-        pooling = [(2, 2), (2, 2), (1, 2), (1, 2), (1, 2), (1, 2), (1, 2)]
+        pooling_by_target_freq = {
+            1: [(2, 2), (2, 2), (1, 2), (1, 2), (1, 2), (1, 2), (1, 2)],
+            4: [(2, 2), (2, 2), (1, 2), (1, 2), (1, 2), (1, 1), (1, 1)],
+            8: [(2, 2), (2, 2), (1, 2), (1, 2), (1, 1), (1, 1), (1, 1)],
+        }
+        pooling = pooling_by_target_freq[target_freq]
+        self.target_freq = target_freq
 
         freq_bins = []
         current_freq = int(n_mels)
