@@ -5,6 +5,8 @@ from torchmetrics import F1Score
 from src.models.custom_model import HP_STGNN
 from src.models.uatr_knn_reg import AcousticAuxTargetExtractor, UATR_KNN_REG
 from src.models.uatr_knn_graph import UATR_KNN_Graph  # 🌟 新增：导入轻量化模型
+from src.models.fa_uatr_knn import FA_UATR_KNN
+from src.models.shufflefac import ShuffleFAC
 from src.models.stereo_semantic_net import KnowledgeUpdateStereoSemanticNet
 from src.models.multifeature_fusion import (
     MultiFeatureConcatMLP,
@@ -148,6 +150,29 @@ class LitModel(L.LightningModule):
             self.aux_loss_weight = Params.get('aux_loss_weight', 0.05)
             self.aux_criterion = nn.SmoothL1Loss()
 
+        elif self.model_name == 'ShuffleFAC':
+            print("Loading ShuffleFAC gamma=16 on Log-Mel input")
+            self.model = ShuffleFAC(
+                num_classes=self.num_classes,
+                in_channels=1,
+                n_mels=Params.get('number_mels', 128),
+                activation=Params.get('shufflefac_activation', 'glu'),
+                dropout=Params.get('dropout', 0.2),
+                filters=[16, 32, 64, 128, 128, 128, 128],
+            )
+
+        elif self.model_name == 'FA_UATR_KNN':
+            print("Loading FA_UATR_KNN: FASC stem + Transformer + KNN-GNN gated fusion")
+            self.model = FA_UATR_KNN(
+                num_classes=self.num_classes,
+                in_channels=1,
+                dim=Params.get('fusion_dim', 128),
+                k=Params.get('knn_k', 8),
+                depth=Params.get('uatr_depth', 1),
+                dropout=Params.get('dropout', 0.2),
+                n_mels=Params.get('number_mels', 128),
+            )
+
         elif self.model_name == 'StereoSemanticNet':
             print("🔥 加载基于知识嵌入的立体语义网络 (StereoSemanticNet)")
             self.model = KnowledgeUpdateStereoSemanticNet(
@@ -233,7 +258,7 @@ class LitModel(L.LightningModule):
             )
                
         else:
-            raise ValueError(f"❌ Unsupported model: {model_name}. Please use HTAN, UATR_KNN, StereoSemanticNet, or MF_* models.")
+            raise ValueError(f"Unsupported model: {model_name}. Please use HTAN, UATR_KNN, ShuffleFAC, FA_UATR_KNN, StereoSemanticNet, or MF_* models.")
 
         self.criterion = nn.CrossEntropyLoss()
         self.aux_target_extractor = getattr(self, "aux_target_extractor", None)
@@ -310,6 +335,10 @@ class LitModel(L.LightningModule):
             waveform = self._extract_waveform(x)
             return self.aux_target_extractor(waveform)
 
+    def _log_gate_mean(self):
+        if hasattr(self.model, "last_gate_mean") and self.model.last_gate_mean is not None:
+            self.log("gate_mean", self.model.last_gate_mean, on_step=False, on_epoch=True, prog_bar=False, logger=False)
+
     def training_step(self, batch, batch_idx):
         x, y, _ = self._unpack_batch(batch)
         if self.model_name == 'UATR_KNN_REG':
@@ -327,6 +356,7 @@ class LitModel(L.LightningModule):
 
         logits = self(x)
         loss = self.criterion(logits, y)
+        self._log_gate_mean()
         self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=False) # 关掉 logger
         return loss
 
@@ -344,6 +374,7 @@ class LitModel(L.LightningModule):
         else:
             logits = self(x)
             loss = self.criterion(logits, y)
+            self._log_gate_mean()
         preds = torch.argmax(logits, dim=1)
         
         self.val_macro_f1(preds, y) 
