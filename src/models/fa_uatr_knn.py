@@ -1,3 +1,10 @@
+"""FA_UATR_KNN 融合模型。
+
+该文件保留后续开发路线：用 FASCStem 提供频率自适应前端，再接
+UATR_KNN 风格的 Transformer + KNN-MRGraphConv，并通过标量门控残差
+融合 Transformer 输出和图分支输出。
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,6 +14,12 @@ from src.models.uatr_knn_graph import MRGraphConv
 
 
 class FA_UATR_KNN(nn.Module):
+    """FA/FASC 前端与 UATR_KNN 关系建模的融合模型。
+
+    输入: Log-Mel `[B, 1, F, T]`。
+    输出: 分类 logits `[B, num_classes]`，或 extract_feature=True 时输出
+    全局特征 `[B, dim]`。
+    """
     def __init__(
         self,
         num_classes,
@@ -62,6 +75,7 @@ class FA_UATR_KNN(nn.Module):
         )
 
     def _position_embedding(self, num_tokens):
+        """返回与当前 token 数匹配的位置编码，必要时线性插值。"""
         if num_tokens <= self.pos_embed.size(1):
             return self.pos_embed[:, :num_tokens, :]
         pos = self.pos_embed.transpose(1, 2)
@@ -69,6 +83,7 @@ class FA_UATR_KNN(nn.Module):
         return pos.transpose(1, 2)
 
     def _get_knn_graph(self, x):
+        """复用 UATR_KNN 的思路，在单样本内部构建 KNN token 图。"""
         # x: [B, N, C]
         num_tokens = x.size(1)
         if num_tokens <= 1:
@@ -80,6 +95,7 @@ class FA_UATR_KNN(nn.Module):
         return dist.topk(k, largest=False).indices
 
     def forward(self, x, extract_feature=False):
+        """执行 FASC stem、token 化、Transformer、KNN-GNN 与门控融合。"""
         feature_map = self.fasc_stem(x)
         tokens = feature_map.flatten(2).transpose(1, 2)
         tokens = self.token_proj(tokens)

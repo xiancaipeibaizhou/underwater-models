@@ -1,3 +1,10 @@
+"""UATR_KNN 模型主体。
+
+输入为 Log-Mel spectrogram `[B, 1, F, T]`。模型先用 CNN patchify 得到
+patch tokens，再按 A/B/C 变体选择 Transformer、KNN-MRGraphConv 或二者组合。
+KNN 图只在单个样本内部构建，不跨 batch 样本连边。
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,6 +13,11 @@ import torch.nn.functional as F
 # 1. 轻量级 Mel Patch 提取器
 # =====================================================================
 class MelPatchifyBlock(nn.Module):
+    """将 Log-Mel 图切成 patch tokens。
+
+    输入 `[B, 1, F, T]`，经过多层 stride=2 CNN 下采样后，输出
+    `[B, N, dim]` tokens 以及 feature map 的 `F_p/T_p` 尺寸。
+    """
     def __init__(self, in_channels=1, dim=96):
         super().__init__()
         # 针对输入 [B, 1, 128, 157] 左右的 Mel 频谱
@@ -40,6 +52,11 @@ class MelPatchifyBlock(nn.Module):
 # 2. 最大相对图卷积 (Max-Relative Graph Conv)
 # =====================================================================
 class MRGraphConv(nn.Module):
+    """Max-Relative Graph Convolution。
+
+    对每个节点收集 KNN 邻居，计算 `x_j - x_i` 的相对特征，在邻居维做
+    max pooling，再与自身特征拼接，经 MLP、残差和 FFN 更新节点。
+    """
     def __init__(self, dim, dropout=0.2):
         super().__init__()
         self.proj = nn.Sequential(
@@ -92,6 +109,12 @@ class MRGraphConv(nn.Module):
 # 3. 最终主模型：UATR-KNN 消融框架
 # =====================================================================
 class UATR_KNN_Graph(nn.Module):
+    """UATR_KNN A/B/C 变体。
+
+    A: Patch + Transformer。
+    B: Patch + KNN-GNN。
+    C: Patch + Transformer + KNN-GNN。
+    """
     def __init__(self, num_classes=5, in_channels=1, dim=96, k=4, depth=1, variant='C', dropout=0.2):
         """
         variant: 
@@ -129,6 +152,7 @@ class UATR_KNN_Graph(nn.Module):
         )
 
     def _get_knn_graph(self, x):
+        """在每条样本内部用欧氏距离构建 KNN 图。"""
         dist = torch.cdist(x, x) # [B, N, N]
         # 排除自身节点
         eye = torch.eye(dist.size(1), device=dist.device).unsqueeze(0)
@@ -138,6 +162,7 @@ class UATR_KNN_Graph(nn.Module):
         return knn_idx
 
     def forward(self, x, extract_feature=False):
+        """执行 patchify、可选 Transformer、可选 KNN-GNN、池化和分类。"""
         # x: [B, 1, F, T]
         x, Fp, Tp = self.patchify(x) # x: [B, N, dim]
         B, N, C = x.shape

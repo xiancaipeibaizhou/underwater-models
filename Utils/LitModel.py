@@ -1,3 +1,12 @@
+"""PyTorch Lightning 模型封装。
+
+LitModel 统一管理不同 model_name 的构建、Log-Mel 特征提取、
+训练/验证/测试指标和 checkpoint 加载时的重建逻辑。
+
+除 MF_* 多特征模型外，大多数模型都直接接收 waveform，然后先经过
+Feature_Extraction_Layer 得到 Log-Mel，再送入具体模型主体。
+"""
+
 import torch
 import torch.nn as nn
 import lightning as L
@@ -62,6 +71,17 @@ def plot_and_save_confusion_matrix(cm, target_names, save_path):
 
 
 class LitModel(L.LightningModule):
+    """统一的 LightningModule。
+
+    model_name 对应关系：
+    - HTAN: 物理启发频率图网络路线。
+    - UATR_KNN: Log-Mel -> Patch/Transformer/KNN-GNN。
+    - ShuffleFAC: Log-Mel -> FA/FASC 轻量 CNN。
+    - FA_UATR_KNN: 后续融合路线，Log-Mel -> FASC -> UATR_KNN 风格关系建模。
+    - StereoSemanticNet: 知识嵌入语义网络。
+    - MF_*: 人工特征多视图路线，直接由模型内部处理 waveform/dict。
+    - UATR_KNN_REG: Log-Mel 主干 + 人工特征辅助回归目标。
+    """
     def __init__(self, Params, model_name, num_classes, numBins=None, RR=None):
         super().__init__()
         self.save_hyperparameters()
@@ -86,6 +106,9 @@ class LitModel(L.LightningModule):
             if isinstance(Params, dict): return Params.get(key, default)
             return default
 
+        # 下面的分支只负责选择模型主体。除 MULTIFEATURE_MODELS 和
+        # UATR_KNN_REG 的特殊辅助头外，forward 都会统一执行：
+        # waveform -> Feature_Extraction_Layer -> self.model(logmel)。
         if self.model_name == 'HTAN':
             expected_t_dim = int((Params.get('segment_length', 5) * Params.get('sample_rate', 16000)) / Params.get('hop_length', 512)) + 1
             
@@ -283,6 +306,11 @@ class LitModel(L.LightningModule):
             self.class_names = [f'Class {i}' for i in range(self.num_classes)]
 
     def forward(self, x):
+        """前向传播。
+
+        常规模型输入 waveform，先提取 Log-Mel；MF_* 模型由自身处理输入；
+        UATR_KNN_REG 需要同时返回辅助回归分支，因此单独分流。
+        """
         if self.model_name in MULTIFEATURE_MODELS:
             return self.model(x)
         if self.model_name == 'UATR_KNN_REG':
@@ -293,6 +321,7 @@ class LitModel(L.LightningModule):
         return self.model(x)
 
     def _unpack_batch(self, batch):
+        """兼容普通 Dataset 与带路径/多特征 dict 的 batch 格式。"""
         if isinstance(batch, (list, tuple)) and len(batch) == 3:
             return batch[0], batch[1], batch[2]
 
@@ -340,6 +369,11 @@ class LitModel(L.LightningModule):
             self.log("gate_mean", self.model.last_gate_mean, on_step=False, on_epoch=True, prog_bar=False, logger=False)
 
     def training_step(self, batch, batch_idx):
+        """训练 step。
+
+        常规模型只计算交叉熵；UATR_KNN_REG 额外加入辅助回归损失。
+        如果模型暴露 last_gate_mean，会记录 gate_mean 便于观察图分支权重。
+        """
         x, y, _ = self._unpack_batch(batch)
         if self.model_name == 'UATR_KNN_REG':
             logits, aux_pred = self._forward_uatr_reg(x, return_aux=True)
@@ -361,6 +395,11 @@ class LitModel(L.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
+        """验证 step。
+
+        早停和 checkpoint 监控 `val_macro_f1`，因此这里维护 torchmetrics
+        的 macro-F1，同时记录验证 loss。
+        """
         x, y, _ = self._unpack_batch(batch)
         if self.model_name == 'UATR_KNN_REG':
             logits, aux_pred = self._forward_uatr_reg(x, return_aux=True)
@@ -383,6 +422,11 @@ class LitModel(L.LightningModule):
         return loss
 
     def test_step(self, batch, batch_idx):
+        """测试 step。
+
+        不在 step 内直接计算最终指标，而是缓存预测、标签、概率和路径，
+        交给 on_test_epoch_end 使用 sklearn 一次性计算。
+        """
         x, y, paths = self._unpack_batch(batch)
         logits = self(x)
         preds = torch.argmax(logits, dim=1)
@@ -397,7 +441,11 @@ class LitModel(L.LightningModule):
         return self.criterion(logits, y)
 
     def on_test_epoch_end(self):
-        """完全使用 sklearn 接管所有严谨指标的计算与绘图"""
+        """使用 sklearn 计算最终测试指标并保存报告。
+
+        输出包括 ACC、weighted precision/recall、Macro-F1、Weighted-F1、
+        confusion_matrix.png、classification_report.txt 和 test_predictions.csv。
+        """
         if len(self.test_preds) > 0:
             preds = torch.cat(self.test_preds).numpy()
             targets = torch.cat(self.test_targets).numpy()

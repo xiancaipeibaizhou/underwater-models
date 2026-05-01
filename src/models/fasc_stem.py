@@ -1,3 +1,9 @@
+"""FASC 前端模块。
+
+从 ShuffleFAC gamma=16 中抽取不含全局池化和分类器的前端，供后续
+FA_UATR_KNN 这类 token 模型复用。该模块只输出 feature map。
+"""
+
 from collections import OrderedDict
 
 import torch.nn as nn

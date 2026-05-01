@@ -1,3 +1,10 @@
+"""ShuffleFAC gamma=16 实现。
+
+模型输入为 Log-Mel spectrogram `[B, 1, F, T]`，内部转为 `[B, C, T, F]`
+以便在频率维执行 FA block / FASC 操作。gamma=16 对应 filters:
+`[16, 32, 64, 128, 128, 128, 128]`。
+"""
+
 from collections import OrderedDict
 
 import torch
@@ -27,6 +34,7 @@ class ContextGating(nn.Module):
 
 
 class FrequencyAttention(nn.Module):
+    """FA block 的通道门控部分，根据频率维响应生成通道权重。"""
     def __init__(self, freq_bins):
         super().__init__()
         self.linear = nn.Linear(freq_bins, 1)
@@ -38,6 +46,7 @@ class FrequencyAttention(nn.Module):
 
 
 class FrequencyPositionalEncoding(nn.Module):
+    """可学习频率位置编码，使网络显式感知不同频带位置。"""
     def __init__(self, freq_bins):
         super().__init__()
         self.pos = nn.Parameter(torch.zeros(freq_bins))
@@ -48,6 +57,11 @@ class FrequencyPositionalEncoding(nn.Module):
 
 
 class FACConv(nn.Module):
+    """Frequency-Aware Convolution 前置增强。
+
+    将通道门控后的频率位置编码注入特征图，对应 ShuffleFAC 中强调的
+    frequency-aware 建模思想。
+    """
     def __init__(self, freq_bins):
         super().__init__()
         self.attention = FrequencyAttention(freq_bins)
@@ -58,6 +72,8 @@ class FACConv(nn.Module):
 
 
 class ChannelShuffle(nn.Module):
+    """FASC 中的 channel shuffle，用于 group convolution 后的信息交换。"""
+
     def __init__(self, groups):
         super().__init__()
         self.groups = groups
@@ -73,6 +89,11 @@ class ChannelShuffle(nn.Module):
 
 
 class ShuffleFACCNN(nn.Module):
+    """ShuffleFAC 的卷积主体。
+
+    每个 stage 包含 FA block，以及 point-wise group conv、depthwise conv、
+    channel shuffle、point-wise group conv 组成的轻量 FASC 结构。
+    """
     def __init__(
         self,
         in_channels=1,
@@ -140,7 +161,11 @@ class ShuffleFACCNN(nn.Module):
 
 
 class ShuffleFAC(nn.Module):
-    """ShuffleFAC gamma=16 for log-mel input [B, 1, F, T]."""
+    """完整 ShuffleFAC 分类器。
+
+    前端为 gamma=16 的 FASC CNN，最后执行 adaptive pooling 和线性分类。
+    它是 Log-Mel 深度模型，不使用 MFCC/MIPE 人工特征输入。
+    """
 
     def __init__(
         self,

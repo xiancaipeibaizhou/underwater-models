@@ -1,3 +1,15 @@
+"""训练入口脚本。
+
+本文件负责把命令行参数整理为 Params，完成数据预处理、DataModule
+构建、LitModel 构建、复杂度统计、训练/验证/测试与结果落盘。
+
+关键参数：
+- data_selection: 0=DeepShip，1=ShipsEar。
+- split_protocol: frame_level 或 recording_level；正式实验使用 recording_level。
+- train_ratio / val_ratio / test_ratio: 数据划分比例，和必须为 1。
+- test_only / ckpt_path: 跳过训练，直接加载指定 checkpoint 做测试。
+"""
+
 import numpy as np
 import argparse
 import torch
@@ -99,6 +111,11 @@ def benchmark_latency(model, input_shape, device, warmup=30, repeats=100):
     return (time.perf_counter() - start) / repeats
 
 def save_model_complexity(model_wrapper, Params, save_dir):
+    """统计当前模型主体的参数量、MACs 与 batch=1 推理延迟。
+
+    这里统计的是 `model_wrapper.model`，即 Log-Mel 特征提取层之后的分类网络。
+    因此 UATR_KNN、ShuffleFAC、FA_UATR_KNN 会使用同一套复杂度统计逻辑。
+    """
     n_mels = Params.get('number_mels', 128)
     sample_rate = Params.get('sample_rate', 16000)
     segment_length = Params.get('segment_length', 5)
@@ -149,6 +166,11 @@ def save_model_complexity(model_wrapper, Params, save_dir):
     return complexity
 
 def configure_mipe_cache(data_module, Params):
+    """把 MIPE 缓存相关参数挂到 DataModule。
+
+    该函数只服务于保留的多特征/辅助实验路线。Log-Mel 主线模型
+    如 UATR_KNN、ShuffleFAC、FA_UATR_KNN 不依赖 MIPE 输入。
+    """
     data_module.target_sr = Params.get('sample_rate', 16000)
     data_module.use_cached_mipe = Params.get('use_cached_mipe', False)
     data_module.precompute_mipe = Params.get('precompute_mipe', False)
@@ -196,6 +218,11 @@ class ForceMetricsWriter(Callback):
 
 
 def main(Params):
+    """根据 Params 启动一次或多次实验。
+
+    该函数不直接解释命令行，而是消费 parse_args 后整理出的 Params。
+    数据集选择、split 协议、模型名称和训练超参数都在这里汇合。
+    """
     model_name = Params['Model_name']
     batch_size = Params['batch_size']
     num_workers = Params['num_workers']
@@ -291,6 +318,8 @@ def main(Params):
         os.makedirs(save_dir, exist_ok=True)
 
         model_config = {
+            # model_config.json 是每个 run 的实验快照，服务器正式实验后
+            # 依靠它确认模型、split 协议、数据参数和复杂度统计是否一致。
             "model": model_name,
             "uatr_variant": Params.get('uatr_variant'),
             "run_index": run_number,
@@ -343,6 +372,8 @@ def main(Params):
             verbose=False,
             save_weights_only=True
         )
+        # best checkpoint 只按验证集 Macro-F1 选择，测试集只在训练结束后评估一次，
+        # 避免把测试集反馈到模型选择中。
     
         early_stopping_callback = EarlyStopping(
             monitor='val_macro_f1', 
@@ -420,7 +451,13 @@ def main(Params):
             file.write(f"Latency ms/batch1: {complexity['latency_ms_batch1']:.6f}\n")
 
 def parse_args():
+    """定义服务器实验常用命令行参数。
+
+    `--model` 选择模型；`--data_selection` 选择数据集；
+    `--split_protocol recording_level` 是当前公平对比的正式协议。
+    """
     parser = argparse.ArgumentParser(description='Run Advanced UATR HTAN Experiments')
+    # 数据集与划分协议。正式对比使用 recording_level，避免同录音切片泄露。
     parser.add_argument('--model', type=str, default='HTAN', help='Select baseline model architecture')
     parser.add_argument('--data_selection', type=int, default=0, help='Dataset selection: 0=DeepShip, 1=ShipsEar')
     parser.add_argument('--split_protocol', type=str, default='recording_level',
@@ -467,6 +504,7 @@ def parse_args():
     parser.add_argument('--uatr_depth', type=int, default=1)
 
     parser.add_argument('--test_snr', type=float, default=None, help='测试集注入的 SNR (dB)')
+    # test_only 模式用于服务器上加载已有 ckpt 做鲁棒性/噪声测试，不触发训练。
     parser.add_argument('--test_only', action='store_true', help='跳过训练，仅加载权重进行测试')
     parser.add_argument('--ckpt_path', type=str, default=None, help='仅测试模式下加载的权重路径')             
     parser.add_argument('--exp_time', type=str, default='', help='按时间戳生成独立文件夹防止覆盖')    

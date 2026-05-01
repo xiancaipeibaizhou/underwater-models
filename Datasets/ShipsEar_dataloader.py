@@ -1,3 +1,12 @@
+"""DeepShip / ShipsEar 分段音频 DataModule。
+
+本文件同时服务 DeepShip 预切片目录和 ShipsEar 预切片目录。核心区别是：
+- frame-level split: 以切片为单位随机划分，可能产生同录音 overlap。
+- recording-level split: 以录音文件夹为单位划分，再展开为切片，是正式实验协议。
+
+setup 后会输出 recording overlap audit；recording-level 模式下 overlap 非 0 会报错。
+"""
+
 import os
 import json
 import collections
@@ -35,6 +44,13 @@ def add_awgn(signal, snr_db, seed_string=None):
 
 
 class ShipsEarDataset(Dataset):
+    """读取单个音频切片并返回 waveform/label。
+
+    默认返回 `(waveform, target)`；测试集可通过 return_path=True 返回
+    `({"waveform": waveform, "path": file_path}, target)`，方便保存预测明细。
+    如果 use_cached_mipe=True，会额外返回缓存/即时计算的 MIPE 特征给保留的
+    多特征路线使用；Log-Mel 主线模型不依赖该字段。
+    """
     def __init__(
         self,
         segment_list,
@@ -186,6 +202,7 @@ class ShipsEarDataset(Dataset):
                 print(f"MIPE cache ready: {idx}/{total}")
 
     def __getitem__(self, idx):
+        """读取 wav 切片，检查采样率，按需加测试噪声并组装 batch item。"""
         file_path, label = self.segment_list[idx]
         
         try:
@@ -246,10 +263,16 @@ class ShipsEarDataset(Dataset):
 
 
 class ShipsEarDataModule(L.LightningDataModule):
+    """LightningDataModule，负责 split 复用/生成、审计和 DataLoader 构建。
+
+    split_file 的 metadata 会记录数据集、协议、比例、随机种子、父目录、
+    类别映射、切片长度和采样率；任一关键项不匹配都会自动重新生成 split。
+    """
     def __init__(self, parent_folder='./Datasets/ShipsEar', batch_size=None, num_workers=8,
                  train_ratio=0.6, val_ratio=0.2, test_ratio=0.2, random_seed=42, 
                  normalize_waveform=False, split_file='shipsear_data_split.json', audit_file='split_audit_report.json',
-                 test_snr=None, is_ssl=False, split_protocol='frame_level', segment_length=5): # 🌟 新增协议选择参数
+                 test_snr=None, is_ssl=False, split_protocol='frame_level', segment_length=5,
+                 target_sr=16000, dataset_name=None):
         super().__init__()
         
         assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-5, "🚨 比例之和必须等于 1.0"
@@ -267,15 +290,45 @@ class ShipsEarDataModule(L.LightningDataModule):
         self.audit_file = audit_file
         self.test_snr = test_snr 
         self.is_ssl = is_ssl
-        self.split_protocol = split_protocol # 🌟 保存当前选择的协议
+        self.split_protocol = split_protocol
         self.segment_length = segment_length
+        self.target_sr = target_sr
+        self.dataset_name = dataset_name or os.path.basename(os.path.normpath(parent_folder)) or "Unknown"
         self.segment_lists = None
 
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None
 
+    def _metadata_parent_folder(self):
+        return os.path.normpath(os.path.abspath(self.parent_folder))
+
+    def _split_metadata(self, class_mapping):
+        return {
+            "dataset": self.dataset_name,
+            "protocol": self.split_protocol,
+            "train_ratio": self.train_ratio,
+            "val_ratio": self.val_ratio,
+            "test_ratio": self.test_ratio,
+            "random_seed": self.random_seed,
+            "parent_folder": self._metadata_parent_folder(),
+            "class_mapping": class_mapping,
+            "segment_length": self.segment_length,
+            "sample_rate": self.target_sr,
+        }
+
+    def _metadata_matches(self, old_meta, expected_meta):
+        for key, expected in expected_meta.items():
+            actual = old_meta.get(key)
+            if isinstance(expected, float):
+                if actual is None or abs(float(actual) - expected) > 1e-8:
+                    return False, key, actual, expected
+            elif actual != expected:
+                return False, key, actual, expected
+        return True, None, None, None
+
     def _verify_and_load_split(self, current_class_mapping):
+        """校验 split_file metadata，匹配时复用，不匹配时返回 None 触发重建。"""
         if not os.path.exists(self.split_file):
             return None
             
@@ -284,40 +337,31 @@ class ShipsEarDataModule(L.LightningDataModule):
                 data = json.load(f)
                 
             meta = data.get('metadata', {})
-            
-            if meta.get('random_seed') != self.random_seed: return None
-            if meta.get('train_ratio') != self.train_ratio: return None
-            if meta.get('val_ratio') != self.val_ratio: return None
-            if meta.get('test_ratio') != self.test_ratio: return None
-            if meta.get('parent_folder') != self.parent_folder: return None
-            if meta.get('class_mapping') != current_class_mapping: return None
-            if meta.get('segment_length') != self.segment_length: return None
-            if meta.get('protocol') != self.split_protocol: return None
-            
-            # 🌟 核心校验：如果当前读取的 JSON 协议和我们代码要求的协议不一致，就拒绝复用，重新生成！
-            if meta.get('protocol') != self.split_protocol: return None 
-            
-            print(f"✅ 校验通过：成功复用历史切分文件 ({meta.get('timestamp')}) [协议: {self.split_protocol}]")
-            return data.get('segment_lists')
+            expected_meta = self._split_metadata(current_class_mapping)
+            matches, key, actual, expected = self._metadata_matches(meta, expected_meta)
+            if not matches:
+                print(f"Split metadata mismatch on {key}: old={actual}, expected={expected}. Regenerating split.")
+                return None
+
+            segment_lists = data.get('segment_lists')
+            if not segment_lists or any(split not in segment_lists for split in ['train', 'val', 'test']):
+                print("Split file is missing train/val/test lists. Regenerating split.")
+                return None
+
+            print(f"Split metadata verified ({meta.get('timestamp')}) [protocol: {self.split_protocol}]")
+            return segment_lists
             
         except Exception as e:
             print(f"⚠️ 解析切分文件失败 ({e})，将重新生成...")
             return None
 
     def save_splits(self, segment_lists, class_mapping):
+        """保存 split 列表及其 metadata，保证后续实验可复现和可审计。"""
+        metadata = self._split_metadata(class_mapping)
+        metadata["timestamp"] = datetime.now().isoformat()
+        metadata["shuffle"] = True
         data = {
-            "metadata": {
-                "timestamp": datetime.now().isoformat(),
-                "protocol": self.split_protocol, # 🌟 保存当前协议类型
-                "random_seed": self.random_seed,
-                "train_ratio": self.train_ratio,
-                "val_ratio": self.val_ratio,
-                "test_ratio": self.test_ratio,
-                "parent_folder": self.parent_folder,
-                "class_mapping": class_mapping,
-                "segment_length": self.segment_length,
-                "shuffle": True 
-            },
+            "metadata": metadata,
             "segment_lists": segment_lists
         }
         with open(self.split_file, 'w') as f:
@@ -327,6 +371,7 @@ class ShipsEarDataModule(L.LightningDataModule):
         return os.path.normpath(os.path.dirname(os.path.abspath(file_path)))
 
     def _recording_overlap_summary(self, segment_lists):
+        """统计 train/val/test 三者之间的录音级 overlap。"""
         recording_sets = {}
         for split in ['train', 'val', 'test']:
             recording_sets[split] = {
@@ -406,11 +451,13 @@ class ShipsEarDataModule(L.LightningDataModule):
         print("="*75 + "\n")
 
     def _audit_recording_overlap(self, segment_lists, inverse_class_mapping, class_mapping, stage=None):
+        """输出并保存 recording-level 审计报告，overlap 非 0 时停止训练。"""
         recording_sets, recording_overlaps = self._recording_overlap_summary(segment_lists)
         splits = ['train', 'val', 'test']
 
         audit_data = {
             "timestamp": datetime.now().isoformat(),
+            "dataset": self.dataset_name,
             "class_mapping": class_mapping,
             "protocol": self.split_protocol,
             "stage": stage,
@@ -418,8 +465,9 @@ class ShipsEarDataModule(L.LightningDataModule):
             "val_ratio": self.val_ratio,
             "test_ratio": self.test_ratio,
             "random_seed": self.random_seed,
-            "parent_folder": self.parent_folder,
+            "parent_folder": self._metadata_parent_folder(),
             "segment_length": self.segment_length,
+            "sample_rate": self.target_sr,
             "splits": {},
             "recording_overlap": recording_overlaps,
         }
@@ -442,6 +490,15 @@ class ShipsEarDataModule(L.LightningDataModule):
                     "recordings": len(class_recordings),
                 }
 
+        print("\nRecording-level split audit")
+        for split in splits:
+            split_info = audit_data["splits"][split]
+            print(
+                f"{split}: segments={split_info['total_segments']} "
+                f"recordings={split_info['total_recordings']} "
+                f"class_distribution={split_info['class_distribution']}"
+            )
+
         for pair_name, overlap_data in recording_overlaps.items():
             print(f"{pair_name} recording overlap: {overlap_data['count']}")
 
@@ -454,6 +511,11 @@ class ShipsEarDataModule(L.LightningDataModule):
                 raise ValueError(f"Recording-level overlap detected: {bad_overlaps}")
 
     def setup(self, stage=None):
+        """准备数据集。
+
+        frame-level 会直接按切片划分；recording-level 先划分录音文件夹，
+        再展开为该录音下的所有切片，从源头避免同录音跨集合。
+        """
         ships_classes = sorted([f.name for f in os.scandir(self.parent_folder) if f.is_dir()])
         class_mapping = {ship: idx for idx, ship in enumerate(ships_classes)}
         inverse_class_mapping = {idx: ship for ship, idx in class_mapping.items()}

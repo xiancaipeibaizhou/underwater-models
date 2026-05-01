@@ -1,110 +1,70 @@
 # Underwater Acoustic Target Recognition
 
-基于深度学习的水下声学目标识别（Underwater Acoustic Target Recognition）模型库。本项目主要针对 **ShipsEar** 等水下音频数据集，提供从数据预处理、特征提取（如Log-Mel谱图）、模型训练到结果分析的完整代码流水线。项目核心框架基于 **PyTorch** 和 **PyTorch Lightning** 构建。
+本工程面向水声目标识别与船舶辐射噪声分类，主要在 DeepShip 和 ShipsEar 两个数据集上评估不同轻量模型在 **strict recording-level split** 下的泛化能力。当前实验重点不是 frame 级随机切片准确率，而是避免同一条录音的不同切片同时进入 train / val / test 后造成的 recording overlap。
 
-## 📂 项目结构
+## 数据集
+
+- **DeepShip**：4 类，`Cargo / Passengership / Tanker / Tug`。
+- **ShipsEar**：当前工程按 5 类处理，通常对应 `A / B / C / D / E` 或 `ClassA / ... / ClassE`。
+- `--data_selection 0`：使用 DeepShip。
+- `--data_selection 1`：使用 ShipsEar。
+
+## 划分协议
+
+工程支持两类 split：
+
+- `frame_level`：直接按切片随机划分。该方式可能让同一原始录音的不同切片出现在 train / val / test 中，导致 recording overlap，结果通常偏乐观。
+- `recording_level`：先按录音划分，再展开为切片。正式实验使用该协议。
+
+正式结果必须检查：
 
 ```text
-underwater-model/
-├── Datasets/                           # 📦 数据集与加载模块
-│   ├── ShipsEar_Data_Preprocessing.py  # 原始音频切割与风浪去噪预处理
-│   ├── ShipsEar_dataloader.py          # 标准帧级打榜划分 (Frame-level Random Split)
-│   └── split_audit_report.json         # 数据集分布审计报告 (自动生成)
-├── src/
-│   └── models/                         
-│       └── custom_model.py             # 🧠 核心模型骨架：Dynamic-HTAN 全套架构
-├── Utils/                              # 🛠️ 核心组件库
-│   ├── Feature_Extraction_Layer.py     # 前端 Log-Mel 时频特征提取
-│   ├── LitModel.py                     # PyTorch Lightning 监督训练核心封装
-│   └── LogMelFilterBank.py             # Mel 滤波器组数学实现
-├── Demo_Parameters.py                  # ⚙️ 基础超参数配置中心
-├── demo_light.py                       # 🚀 HTAN 模型主训练入口 (支持动态传参)
-├── baseline_resnet.py                  # 📊 竞品对比实验基线 (纯视觉黑盒模型)
-├── feature_similarity_analysis.py      # 📈 t-SNE 高维特征聚类可视化工具
-├── plot_curves.py                      # 📉 混淆矩阵与训练曲线生成器
-└── requirements.txt                    # 📦 Python 环境依赖包列表
+train-val recording overlap = 0
+train-test recording overlap = 0
+val-test recording overlap = 0
 ```
 
-## 🧠 核心模型架构与图构建流程 (HTAN)
+`Datasets/ShipsEar_dataloader.py` 会在 setup 后输出 split audit，并在 recording-level 模式下检测到 overlap 时直接停止训练。
 
-本项目在 `src/models/custom_model.py` 中定义了核心创新模型 **HTAN** (包含物理启发频率图网络 `HarmonicFrequencyGCN`)。其图构建与特征流转的严谨过程如下：
+## 当前主要模型
 
-1. **时频特征提取与图重构 (逐时间步的频率图)**：前端多尺度 CNN 提取时频特征。将每个时间步单独提取出来，对频率维度进行建图，张量变形为 `[B * T_out, F_out, C]`，节点代表单个时间片上的“频率 bin”。
-2. **物理先验拓扑的初始化 (静态结构约束)**：通过声学物理规律构造频率先验拓扑矩阵 `A_prior`，包含：节点自连接、相邻频带连续性连接、以及单向判断后对称赋值的 2/3/4 倍谐波连接，最后进行行归一化。
-3. **动态注意力打分与掩码融合 (先验决定拓扑，动态决定权重)**：前向传播时，计算动态注意力得分。`A_prior` 仅作为**结构掩码**，屏蔽不符合物理先验（非连续、非谐波）的边（将其注意力得分置为 `-1e9`），再对合法边做 Softmax 得到最终的动态概率转移矩阵。
-4. **图卷积传递与频率池化 (特征更新)**：使用动态概率矩阵进行消息传递，经过线性层、ReLU、残差和 LayerNorm 更新节点特征。随后恢复维度，对频率维度执行 `mean` 和 `max` 双池化并拼接，生成时间序列特征，送入后续的双向 GRU 和时间注意力层（TemporalAttention）。
+- `UATR_KNN`：Log-Mel 输入，Patch tokens + Transformer + KNN-MRGraphConv。
+- `ShuffleFAC`：Log-Mel 输入，基于 FA block / FASC 的轻量 CNN。
+- `MF_CONCAT`：MFCC / Delta MFCC / STFT 统计特征直接拼接。
+- `MF_BRANCH`：人工特征多分支 CNN 融合。
+- `UATR_KNN_REG`：Log-Mel 主干 + 人工特征辅助回归约束。
+- `FA_UATR_KNN`：后续计划重点，尝试将 ShuffleFAC 的 FA/FASC 前端与 UATR_KNN 的 Transformer + KNN-GNN 结合。
 
-> **⚠️ 重要说明：当前默认训练链路与 AST 模型**
-> 尽管 `custom_model.py` 定义了严密的 HTAN 频率图网络，但目前仓库默认的训练入口 (`demo_light.py` -> `Utils/Network_functions.py`) 实际上主要实例化并运行的是 **AST (Audio Spectrogram Transformer) 系列模型**（如 `ASTBase`, `ASTAdapter`, `ASTLoRA` 等）。如果您希望训练完整的 HTAN 模型，请在 `Utils/Network_functions.py` 中自行将 `initialize_model` 的逻辑分支指向 `HTAN`。
+## 当前核心结论
 
-## 🛠️ 环境依赖
+- 人工特征直接输入路线整体效果较弱。
+- MIPE 加入后没有带来稳定提升。
+- `UATR_KNN-C` 的 Transformer 与 KNN-GNN 组合有一定 patch 关系建模价值。
+- `ShuffleFAC` 的 FA/FASC block 在 DeepShip 和 ShipsEar 上都表现更强，尤其 ShipsEar 的 Macro-F1 提升明显。
+- 后续应优先探索 `FA block + UATR_KNN` 的融合模型，而不是继续扩大 MFCC / MIPE / REG 路线。
 
-请确保您的计算机上已安装 Python 3.8 或更高版本。建议使用虚拟环境（如 Conda 或 venv）。
+## 文档入口
 
-使用以下命令安装所需的 Python 依赖包：
+- [实验结果汇总](docs/EXPERIMENT_SUMMARY.md)
+- [模型说明](docs/MODEL_DESCRIPTION.md)
+- [下一步计划](docs/NEXT_STEPS.md)
+- [服务器运行命令](docs/RUN_COMMANDS.md)
+- [MIPE+MFCC 单独运行说明](README_RUN_MIPE_MFCC.md)
+
+## 快速运行示例
+
+ShipsEar + UATR_KNN-C：
 
 ```bash
-git clone [https://github.com/your-username/underwater-model.git](https://github.com/your-username/underwater-model.git)
-cd underwater-model
-pip install -r requirements.txt
+python demo_light.py \
+  --model UATR_KNN \
+  --uatr_variant C \
+  --data_selection 1 \
+  --split_protocol recording_level \
+  --segment_length 5 \
+  --train_ratio 0.7 \
+  --val_ratio 0.1 \
+  --test_ratio 0.2
 ```
 
-*主要依赖包括：`torch`, `pytorch-lightning`, `librosa`, `numpy`, `pandas`, `matplotlib`, `scikit-learn` 等。*
-
-## 🚀 快速开始
-
-### 1. 数据准备
-1. 下载 **ShipsEar** 数据集，并将原始音频文件（`.wav`）放入 `shipsEar_AUDIOS/` 目录下。
-2. 运行标签生成脚本，为音频文件生成对应的类别标签：
-   ```bash
-   cd shipsEar_AUDIOS
-   python auto_label.py
-   cd ..
-   ```
-3. 运行数据预处理脚本进行离线特征提取或数据清理（视具体需求而定）：
-   ```bash
-   python Datasets/ShipsEar_Data_Preprocessing.py
-   ```
-
-### 2. 参数配置
-在开始训练之前，您可以通过修改 `Demo_Parameters.py` 文件来调整全局超参数：
-* **数据参数**：采样率 (Sample Rate)、帧长 (Frame Length)、跳步 (Hop Length)
-* **训练参数**：批次大小 (`batch_size`)、学习率 (`learning_rate`)、最大训练轮数 (`max_epochs`)
-* **模型参数**：网络结构的具体维度和深度
-
-### 3. 模型训练与评估
-项目使用 PyTorch Lightning 封装了标准的训练、验证和测试流程。直接运行 `demo_light.py` 即可启动训练：
-
-```bash
-python demo_light.py
-```
-*说明：训练过程中会自动在终端输出进度条，并在每轮结束后验证准确率。最优模型权重会自动保存，训练结束后将在测试集上进行最终评估。*
-
-### 4. 批量执行实验 (消融实验)
-如果您需要测试不同的参数组合或运行消融实验（Ablation Study），可以使用提供的 Shell 脚本自动化运行：
-
-```bash
-chmod +x run_experiments.sh
-./run_experiments.sh
-```
-*实验的输出结果与评估指标将自动追加保存至 `htan_ablations_results.csv` 文件中，方便后续对比分析。*
-
-## 📊 结果分析与可视化
-
-训练或消融实验完成后，您可以使用内置的分析脚本对模型性能进行深度剖析：
-
-* **绘制训练曲线**（Loss 和 Accuracy）：
-  ```bash
-  python plot_curves.py
-  ```
-* **特征相似度与特征空间分析**（如 t-SNE 降维可视化）：
-  ```bash
-  python feature_similarity_analysis.py
-  ```
-
-## 📌 数据集划分说明
-
-为了保证实验的可重复性，数据集的划分被固定并记录在以下文件中：
-* `shipsear_data_split.json`: 记录具体的划分配置和路径映射。
-* `split_indices.txt`: 具体的样本索引。
-* `split_audit_report.json`: 数据集划分的分布审计，确保训练/验证/测试集中各类别的均衡性。
+完整服务器命令见 [docs/RUN_COMMANDS.md](docs/RUN_COMMANDS.md)。
