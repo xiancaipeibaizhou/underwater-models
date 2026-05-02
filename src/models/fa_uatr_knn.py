@@ -132,6 +132,7 @@ class FA_UATR_KNN_V2(nn.Module):
     - 默认使用 pre-transform tokens 构图，避免默认从 x_trans 构图。
     - 支持 2D separable learnable positional embedding。
     - 支持 scalar / token / element gate，默认 token-wise gate。
+    - 支持 fusion_mode 诊断 Transformer、Graph 与 gate 融合。
     """
 
     def __init__(
@@ -151,6 +152,7 @@ class FA_UATR_KNN_V2(nn.Module):
         knn_source="pre_trans",
         gate_type="token",
         gate_init_bias=-2.0,
+        fusion_mode="gated",
     ):
         super().__init__()
         if fa_arch not in ("serial", "parallel"):
@@ -163,6 +165,8 @@ class FA_UATR_KNN_V2(nn.Module):
             raise ValueError("knn_source must be 'pre_trans' or 'post_trans'.")
         if gate_type not in ("scalar", "token", "element"):
             raise ValueError("gate_type must be 'scalar', 'token', or 'element'.")
+        if fusion_mode not in ("gated", "trans_only", "graph_only", "fixed"):
+            raise ValueError("fusion_mode must be 'gated', 'trans_only', 'graph_only', or 'fixed'.")
 
         self.dim = dim
         self.k = k
@@ -172,7 +176,14 @@ class FA_UATR_KNN_V2(nn.Module):
         self.knn_metric = knn_metric
         self.knn_source = knn_source
         self.gate_type = gate_type
+        self.fusion_mode = fusion_mode
         self.last_gate_mean = None
+        self.last_gate_std = None
+        self.last_gate_min = None
+        self.last_gate_max = None
+        self.last_trans_norm = None
+        self.last_graph_norm = None
+        self.last_graph_delta_norm = None
 
         self.fasc_stem = FASCStem(
             in_channels=in_channels,
@@ -254,19 +265,52 @@ class FA_UATR_KNN_V2(nn.Module):
         dist = dist.masked_fill(eye, float("inf"))
         return dist.topk(k, largest=False).indices
 
-    def _graph_branch(self, graph_source):
-        knn_idx = self._get_knn_graph(graph_source)
+    def _graph_branch(self, graph_feat, knn_base=None):
+        if knn_base is None:
+            knn_base = graph_feat
+        knn_idx = self._get_knn_graph(knn_base)
         if knn_idx is None:
-            return graph_source
-        return self.graph_conv(graph_source, knn_idx)
+            return graph_feat
+        return self.graph_conv(graph_feat, knn_idx)
+
+    def _set_branch_diagnostics(self, x_trans, x_graph):
+        self.last_trans_norm = x_trans.norm(dim=-1).mean().detach()
+        self.last_graph_norm = x_graph.norm(dim=-1).mean().detach()
+        self.last_graph_delta_norm = (x_graph - x_trans).norm(dim=-1).mean().detach()
+
+    def _set_constant_gate_diagnostics(self, x_trans, value):
+        gate_value = x_trans.new_tensor(value)
+        self.last_gate_mean = gate_value
+        self.last_gate_std = x_trans.new_tensor(0.0)
+        self.last_gate_min = gate_value
+        self.last_gate_max = gate_value
+
+    def _set_gate_diagnostics(self, gate):
+        gate_detached = gate.detach()
+        self.last_gate_mean = gate_detached.mean()
+        self.last_gate_std = gate_detached.std(unbiased=False)
+        self.last_gate_min = gate_detached.min()
+        self.last_gate_max = gate_detached.max()
 
     def _fuse(self, x_trans, x_graph):
+        self._set_branch_diagnostics(x_trans, x_graph)
+
+        if self.fusion_mode == "trans_only":
+            self._set_constant_gate_diagnostics(x_trans, 0.0)
+            return x_trans
+        if self.fusion_mode == "graph_only":
+            self._set_constant_gate_diagnostics(x_trans, 1.0)
+            return x_graph
+        if self.fusion_mode == "fixed":
+            self._set_constant_gate_diagnostics(x_trans, 0.5)
+            return 0.5 * x_trans + 0.5 * x_graph
+
         gate_input = torch.cat([x_trans, x_graph], dim=-1)
         if self.gate_type == "scalar":
             gate = torch.sigmoid(self.gate_mlp(gate_input.mean(dim=1))).unsqueeze(1)
         else:
             gate = torch.sigmoid(self.gate_mlp(gate_input))
-        self.last_gate_mean = gate.mean().detach()
+        self._set_gate_diagnostics(gate)
         return x_trans + gate * (x_graph - x_trans)
 
     def forward(self, x, extract_feature=False):
@@ -277,17 +321,29 @@ class FA_UATR_KNN_V2(nn.Module):
         else:
             tokens = feature_map.flatten(2).transpose(1, 2)
             tokens = tokens + self._position_embedding_1d(tokens.size(1)).to(tokens.dtype)
-        tokens = self.pos_drop(self.token_proj(tokens))
+        tokens = self.token_proj(tokens)
+        tokens_for_graph = tokens
+        tokens_for_trans = self.pos_drop(tokens)
 
-        x_trans = self.transformer(tokens)
+        x_trans = self.transformer(tokens_for_trans)
         x_trans = self.norm_trans(x_trans)
 
         if self.fa_arch == "parallel":
-            graph_source = tokens if self.knn_source == "pre_trans" else x_trans
-            x_graph = self._graph_branch(graph_source)
+            if self.knn_source == "pre_trans":
+                knn_base = tokens_for_graph
+                graph_feat = tokens_for_graph
+            else:
+                knn_base = x_trans
+                graph_feat = x_trans
+            x_graph = self._graph_branch(graph_feat, knn_base)
         else:
-            graph_source = x_trans if self.knn_source == "post_trans" else tokens
-            x_graph = self._graph_branch(graph_source)
+            if self.knn_source == "post_trans":
+                knn_base = x_trans
+                graph_feat = x_trans
+            else:
+                knn_base = tokens_for_graph
+                graph_feat = tokens_for_graph
+            x_graph = self._graph_branch(graph_feat, knn_base)
 
         x_fused = self._fuse(x_trans, x_graph)
         x_global = self.global_pool(x_fused.transpose(1, 2)).squeeze(-1)

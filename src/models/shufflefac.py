@@ -196,9 +196,11 @@ class ShuffleFAC(nn.Module):
         )
         self.fc = nn.Linear(filters[-1], num_classes)
 
-    def forward(self, x):
+    def forward(self, x, extract_feature=False):
         # Feature_Extraction_Layer returns [B, 1, F, T]; ShuffleFAC operates on [B, 1, T, F].
         x = x.transpose(2, 3)
         x = self.cnn(x)
         x = x.flatten(1)
+        if extract_feature:
+            return x
         return self.fc(x)

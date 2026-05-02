@@ -16,6 +16,7 @@ from src.models.uatr_knn_reg import AcousticAuxTargetExtractor, UATR_KNN_REG
 from src.models.uatr_knn_graph import UATR_KNN_Graph  # 🌟 新增：导入轻量化模型
 from src.models.fa_uatr_knn import FA_UATR_KNN, FA_UATR_KNN_V2
 from src.models.shufflefac import ShuffleFAC
+from src.models.shufflefac_clipgraph import ShuffleFACClipGraph
 from src.models.stereo_semantic_net import KnowledgeUpdateStereoSemanticNet
 from src.models.multifeature_fusion import (
     MultiFeatureConcatMLP,
@@ -184,6 +185,21 @@ class LitModel(L.LightningModule):
                 filters=[16, 32, 64, 128, 128, 128, 128],
             )
 
+        elif self.model_name == 'ShuffleFAC_CLIPGRAPH':
+            print("Loading ShuffleFAC_CLIPGRAPH: recording-level clip graph aggregation")
+            self.model = ShuffleFACClipGraph(
+                num_classes=self.num_classes,
+                in_channels=1,
+                gamma=Params.get('shufflefac_gamma', 16),
+                graph_hidden_dim=Params.get('graph_hidden_dim', 128),
+                graph_layers=Params.get('graph_layers', 1),
+                graph_k=Params.get('graph_k', 2),
+                dropout=Params.get('dropout', 0.2),
+                edge_mode=Params.get('edge_mode', 'temporal_similarity'),
+                pooling=Params.get('graph_pooling', 'attention'),
+                n_mels=Params.get('number_mels', 128),
+            )
+
         elif self.model_name == 'FA_UATR_KNN':
             print("Loading FA_UATR_KNN: FASC stem + Transformer + KNN-GNN gated fusion")
             self.model = FA_UATR_KNN(
@@ -213,6 +229,7 @@ class LitModel(L.LightningModule):
                 knn_source=Params.get('knn_source', 'pre_trans'),
                 gate_type=Params.get('gate_type', 'token'),
                 gate_init_bias=Params.get('gate_init_bias', -2.0),
+                fusion_mode=Params.get('fusion_mode', 'gated'),
             )
 
         elif self.model_name == 'StereoSemanticNet':
@@ -300,7 +317,7 @@ class LitModel(L.LightningModule):
             )
                
         else:
-            raise ValueError(f"Unsupported model: {model_name}. Please use HTAN, UATR_KNN, ShuffleFAC, FA_UATR_KNN, FA_UATR_KNN_V2, StereoSemanticNet, or MF_* models.")
+            raise ValueError(f"Unsupported model: {model_name}. Please use HTAN, UATR_KNN, ShuffleFAC, ShuffleFAC_CLIPGRAPH, FA_UATR_KNN, FA_UATR_KNN_V2, StereoSemanticNet, or MF_* models.")
 
         self.criterion = nn.CrossEntropyLoss()
         self.aux_target_extractor = getattr(self, "aux_target_extractor", None)
@@ -314,7 +331,13 @@ class LitModel(L.LightningModule):
         self.test_preds = []
         self.test_targets = []
         self.test_probs = []
+        self.test_logits = []
         self.test_paths = []
+        self.test_recording_ids = []
+        self.val_logits = []
+        self.val_targets = []
+        self.val_recording_ids = []
+        self._warned_missing_recording_id = False
         
         # 🌟 动态判定数据集的 class names
         if self.num_classes == 5:
@@ -334,6 +357,8 @@ class LitModel(L.LightningModule):
             return self.model(x)
         if self.model_name == 'UATR_KNN_REG':
             return self._forward_uatr_reg(x, return_aux=False)
+        if self.model_name == 'ShuffleFAC_CLIPGRAPH':
+            return self._forward_clipgraph(x)
         if isinstance(x, dict):
             x = x.get("waveform", x.get("x"))
         x = self.feature_extractor(x)
@@ -342,15 +367,20 @@ class LitModel(L.LightningModule):
     def _unpack_batch(self, batch):
         """兼容普通 Dataset 与带路径/多特征 dict 的 batch 格式。"""
         if isinstance(batch, (list, tuple)) and len(batch) == 3:
-            return batch[0], batch[1], batch[2]
+            return batch[0], batch[1], batch[2], None
 
         x, y = batch
         paths = None
+        recording_ids = None
         if isinstance(x, dict) and "path" in x:
             paths = x["path"]
             x = dict(x)
             x.pop("path", None)
-        return x, y, paths
+        if isinstance(x, dict) and "recording_id" in x:
+            recording_ids = x["recording_id"]
+            x = dict(x)
+            x.pop("recording_id", None)
+        return x, y, paths, recording_ids
 
     def _normalize_paths(self, paths, batch_size):
         if paths is None:
@@ -360,6 +390,23 @@ class LitModel(L.LightningModule):
         if isinstance(paths, (list, tuple)):
             return [str(p) for p in paths]
         return [str(p) for p in list(paths)]
+
+    def _normalize_recording_ids(self, recording_ids, paths, batch_size):
+        if recording_ids is not None:
+            if isinstance(recording_ids, str):
+                return [recording_ids]
+            if isinstance(recording_ids, (list, tuple)):
+                return [str(rid) for rid in recording_ids]
+            return [str(rid) for rid in list(recording_ids)]
+
+        normalized_paths = self._normalize_paths(paths, batch_size)
+        result = []
+        for path in normalized_paths:
+            if path:
+                result.append(os.path.normpath(os.path.dirname(os.path.abspath(path))))
+            else:
+                result.append("")
+        return result
 
     def _extract_waveform(self, x):
         if isinstance(x, dict):
@@ -376,6 +423,21 @@ class LitModel(L.LightningModule):
         log_mel = self.feature_extractor(waveform)
         return self.model(log_mel, return_aux=return_aux)
 
+    def _forward_clipgraph(self, x, extract_feature=False):
+        waveform = self._extract_waveform(x)
+        if waveform.ndim == 5:
+            return self.model(waveform, extract_feature=extract_feature)
+        if waveform.ndim != 3:
+            raise ValueError(
+                f"ShuffleFAC_CLIPGRAPH expects waveform bag [B,S,L] or logmel bag [B,S,1,F,T], "
+                f"got {tuple(waveform.shape)}"
+            )
+        batch_size, num_clips, num_samples = waveform.shape
+        flat_waveform = waveform.reshape(batch_size * num_clips, num_samples)
+        log_mel = self.feature_extractor(flat_waveform)
+        log_mel = log_mel.view(batch_size, num_clips, *log_mel.shape[1:])
+        return self.model(log_mel, extract_feature=extract_feature)
+
     def _build_aux_target(self, x):
         if self.aux_target_extractor is None:
             raise RuntimeError("aux_target_extractor is not initialized.")
@@ -383,17 +445,83 @@ class LitModel(L.LightningModule):
             waveform = self._extract_waveform(x)
             return self.aux_target_extractor(waveform)
 
-    def _log_gate_mean(self):
-        if hasattr(self.model, "last_gate_mean") and self.model.last_gate_mean is not None:
-            self.log("gate_mean", self.model.last_gate_mean, on_step=False, on_epoch=True, prog_bar=False, logger=False)
+    def _log_model_diagnostics(self):
+        diagnostic_names = {
+            "last_gate_mean": "gate_mean",
+            "last_gate_std": "gate_std",
+            "last_gate_min": "gate_min",
+            "last_gate_max": "gate_max",
+            "last_trans_norm": "trans_norm",
+            "last_graph_norm": "graph_norm",
+            "last_graph_delta_norm": "graph_delta_norm",
+            "last_attn_entropy": "attn_entropy",
+        }
+        for attr_name, log_name in diagnostic_names.items():
+            value = getattr(self.model, attr_name, None)
+            if value is not None:
+                self.log(log_name, value, on_step=False, on_epoch=True, prog_bar=False)
+
+    def _compute_recording_metrics(self, logits, targets, recording_ids):
+        if len(recording_ids) == 0 or all(not rid for rid in recording_ids):
+            if not self._warned_missing_recording_id:
+                print("Warning: recording_id/path is missing; recording-level metrics are skipped.")
+                self._warned_missing_recording_id = True
+            return None
+
+        recording_logits = {}
+        recording_targets = {}
+        for logit, target, recording_id in zip(logits, targets, recording_ids):
+            if not recording_id:
+                continue
+            recording_logits.setdefault(recording_id, []).append(logit)
+            recording_targets.setdefault(recording_id, int(target))
+
+        if not recording_logits:
+            return None
+
+        rids = sorted(recording_logits.keys())
+        mean_logits = np.stack([np.stack(recording_logits[rid], axis=0).mean(axis=0) for rid in rids])
+        rec_targets = np.array([recording_targets[rid] for rid in rids], dtype=np.int64)
+        rec_preds = mean_logits.argmax(axis=1)
+
+        return {
+            "recording_ids": rids,
+            "targets": rec_targets,
+            "preds": rec_preds,
+            "logits": mean_logits,
+            "ACC": accuracy_score(rec_targets, rec_preds),
+            "F1_Macro": f1_score(rec_targets, rec_preds, average="macro", zero_division=0),
+            "F1_Weighted": f1_score(rec_targets, rec_preds, average="weighted", zero_division=0),
+        }
+
+    def on_validation_epoch_end(self):
+        if getattr(self.trainer, "sanity_checking", False):
+            self.val_logits.clear()
+            self.val_targets.clear()
+            self.val_recording_ids.clear()
+            return
+        if not self.val_logits:
+            return
+
+        logits = torch.cat(self.val_logits).numpy()
+        targets = torch.cat(self.val_targets).numpy()
+        rec_metrics = self._compute_recording_metrics(logits, targets, self.val_recording_ids)
+        if rec_metrics is not None:
+            self.log("val_recording_acc", rec_metrics["ACC"], on_step=False, on_epoch=True, prog_bar=False, logger=False)
+            self.log("val_recording_macro_f1", rec_metrics["F1_Macro"], on_step=False, on_epoch=True, prog_bar=False, logger=False)
+            self.log("val_recording_weighted_f1", rec_metrics["F1_Weighted"], on_step=False, on_epoch=True, prog_bar=False, logger=False)
+
+        self.val_logits.clear()
+        self.val_targets.clear()
+        self.val_recording_ids.clear()
 
     def training_step(self, batch, batch_idx):
         """训练 step。
 
         常规模型只计算交叉熵；UATR_KNN_REG 额外加入辅助回归损失。
-        如果模型暴露 last_gate_mean，会记录 gate_mean 便于观察图分支权重。
+        如果模型暴露诊断变量，会记录 gate/branch 统计便于观察图分支权重。
         """
-        x, y, _ = self._unpack_batch(batch)
+        x, y, _, _ = self._unpack_batch(batch)
         if self.model_name == 'UATR_KNN_REG':
             logits, aux_pred = self._forward_uatr_reg(x, return_aux=True)
             ce_loss = self.criterion(logits, y)
@@ -409,7 +537,7 @@ class LitModel(L.LightningModule):
 
         logits = self(x)
         loss = self.criterion(logits, y)
-        self._log_gate_mean()
+        self._log_model_diagnostics()
         self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=False) # 关掉 logger
         return loss
 
@@ -419,7 +547,7 @@ class LitModel(L.LightningModule):
         早停和 checkpoint 监控 `val_macro_f1`，因此这里维护 torchmetrics
         的 macro-F1，同时记录验证 loss。
         """
-        x, y, _ = self._unpack_batch(batch)
+        x, y, paths, recording_ids = self._unpack_batch(batch)
         if self.model_name == 'UATR_KNN_REG':
             logits, aux_pred = self._forward_uatr_reg(x, return_aux=True)
             ce_loss = self.criterion(logits, y)
@@ -432,8 +560,13 @@ class LitModel(L.LightningModule):
         else:
             logits = self(x)
             loss = self.criterion(logits, y)
-            self._log_gate_mean()
+            self._log_model_diagnostics()
         preds = torch.argmax(logits, dim=1)
+        self.val_logits.append(logits.detach().cpu())
+        self.val_targets.append(y.detach().cpu())
+        self.val_recording_ids.extend(
+            self._normalize_recording_ids(recording_ids, paths, y.size(0))
+        )
         
         self.val_macro_f1(preds, y) 
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=False)
@@ -446,7 +579,7 @@ class LitModel(L.LightningModule):
         不在 step 内直接计算最终指标，而是缓存预测、标签、概率和路径，
         交给 on_test_epoch_end 使用 sklearn 一次性计算。
         """
-        x, y, paths = self._unpack_batch(batch)
+        x, y, paths, recording_ids = self._unpack_batch(batch)
         logits = self(x)
         preds = torch.argmax(logits, dim=1)
         probs = torch.softmax(logits, dim=1)
@@ -455,7 +588,11 @@ class LitModel(L.LightningModule):
         self.test_preds.append(preds.cpu())
         self.test_targets.append(y.cpu())
         self.test_probs.append(probs.detach().cpu())
+        self.test_logits.append(logits.detach().cpu())
         self.test_paths.extend(self._normalize_paths(paths, y.size(0)))
+        self.test_recording_ids.extend(
+            self._normalize_recording_ids(recording_ids, paths, y.size(0))
+        )
         
         return self.criterion(logits, y)
 
@@ -469,6 +606,7 @@ class LitModel(L.LightningModule):
             preds = torch.cat(self.test_preds).numpy()
             targets = torch.cat(self.test_targets).numpy()
             probs = torch.cat(self.test_probs).numpy()
+            logits = torch.cat(self.test_logits).numpy()
             
             # 1. 算尽天下指标
             acc = accuracy_score(targets, preds)
@@ -485,6 +623,18 @@ class LitModel(L.LightningModule):
                 'F1_Macro': f1_mac,
                 'F1_Weighted': f1_wei
             }
+
+            recording_metrics = self._compute_recording_metrics(
+                logits,
+                targets,
+                self.test_recording_ids,
+            )
+            if recording_metrics is not None:
+                self.custom_metrics.update({
+                    'Recording_ACC': recording_metrics['ACC'],
+                    'Recording_F1_Macro': recording_metrics['F1_Macro'],
+                    'Recording_F1_Weighted': recording_metrics['F1_Weighted'],
+                })
             
             # 2. 定位我们在主函数指定的专属极简文件夹
             save_dir = getattr(self, "test_save_dir", ".")
@@ -522,6 +672,29 @@ class LitModel(L.LightningModule):
                     for class_idx in range(self.num_classes):
                         row[f"prob_class_{class_idx}"] = float(prob_row[class_idx])
                     writer.writerow(row)
+
+            if recording_metrics is not None:
+                rec_pred_path = os.path.join(save_dir, "recording_predictions.csv")
+                rec_fieldnames = ["recording_id", "true_label", "pred_label", "confidence"]
+                rec_fieldnames.extend([f"logit_class_{i}" for i in range(self.num_classes)])
+                with open(rec_pred_path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=rec_fieldnames)
+                    writer.writeheader()
+                    for rid, target, pred, logit_row in zip(
+                        recording_metrics["recording_ids"],
+                        recording_metrics["targets"],
+                        recording_metrics["preds"],
+                        recording_metrics["logits"],
+                    ):
+                        row = {
+                            "recording_id": rid,
+                            "true_label": int(target),
+                            "pred_label": int(pred),
+                            "confidence": float(np.max(logit_row)),
+                        }
+                        for class_idx in range(self.num_classes):
+                            row[f"logit_class_{class_idx}"] = float(logit_row[class_idx])
+                        writer.writerow(row)
             
             print("\n" + "="*60)
             print("🚀 [TEST SET] DETAILED CLASSIFICATION REPORT")
@@ -534,7 +707,9 @@ class LitModel(L.LightningModule):
             self.test_preds.clear()
             self.test_targets.clear()
             self.test_probs.clear()
+            self.test_logits.clear()
             self.test_paths.clear()
+            self.test_recording_ids.clear()
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(

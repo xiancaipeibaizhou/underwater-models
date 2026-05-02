@@ -1,0 +1,28 @@
+CNN:
+  n_class: 4 
+  n_input_ch: 1
+  activation: relu
+  conv_dropout: 0.5
+  kernel_size: [3,3,3,3,3,3,3,]
+  padding: [1,1,1,1,1,1,1]
+  stride: [ 1, 1, 1, 1, 1, 1, 1 ]
+  nb_filters: [ 32, 64, 128, 256, 256, 256, 256 ] 
+  pooling: [ [ 2, 2 ], [ 2, 2 ], [ 1, 2 ], [ 1, 2 ], [ 1, 2 ], [ 1, 2 ], [ 1, 2 ] ]
+
+  normalization: batch
+
+
+feats:
+  n_mels: 128
+  n_fft: 4096
+  hop_length: 2048
+  win_length: 4096
+  sample_rate: 16000
+  f_min: 0
+  f_max: 8000
+
+data:
+  train_folder: "/home/user/Deepship/preprocessed_data/train"
+  val_folder: "/home/user/Deepship/preprocessed_data/val"
+  test_folder: "/home/user/Deepship/preprocessed_data/test"
+  audio_max_len: 3

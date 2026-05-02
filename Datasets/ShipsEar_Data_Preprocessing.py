@@ -3,12 +3,14 @@ import librosa
 import soundfile as sf
 import math
 
-def Generate_Segments(dataset_dir, target_sr=16000, segment_length=5):
+def Generate_Segments(dataset_dir, target_sr=16000, segment_length=5, dest_dir=None):
     '''
     dataset_dir: 包含 A, B, C, D, E 子文件夹的数据集根目录
     target_sr: 目标采样率 (16000 Hz)
-    segment_length: 切片长度 (5秒)
+    segment_length: 切片长度
+    dest_dir: 可选输出根目录；用于 3s 等非默认切片，避免和已有 5s 切片混用
     '''
+    output_root = dest_dir or dataset_dir
     # 直接使用我们已经分好类的五个文件夹
     ship_type = ['A', 'B', 'C', 'D', 'E']
     
@@ -25,7 +27,7 @@ def Generate_Segments(dataset_dir, target_sr=16000, segment_length=5):
         
         for file_name in wav_files:
             subfolder_name = os.path.splitext(file_name)[0]
-            segment_folder_path = os.path.join(ship_dir, subfolder_name)
+            segment_folder_path = os.path.join(output_root, ship, subfolder_name)
             
             if not os.path.exists(segment_folder_path):
                 segmentation_needed = True
@@ -37,7 +39,7 @@ def Generate_Segments(dataset_dir, target_sr=16000, segment_length=5):
         print("开始提取音频特征与切片，这可能需要几分钟时间...")
     else:
         print("所有音频已切片完毕，跳过处理。可以直接去训练啦！")
-        return
+        return output_root
 
     # 正式开始切片流程
     total_processed = 0
@@ -45,12 +47,13 @@ def Generate_Segments(dataset_dir, target_sr=16000, segment_length=5):
         ship_dir = os.path.join(dataset_dir, ship)
         if not os.path.exists(ship_dir):
             continue
+        os.makedirs(os.path.join(output_root, ship), exist_ok=True)
             
         wav_files = [f for f in os.listdir(ship_dir) if f.lower().endswith('.wav') and os.path.isfile(os.path.join(ship_dir, f))]
         
         for file_name in wav_files:
             subfolder_name = os.path.splitext(file_name)[0]
-            segment_folder_path = os.path.join(ship_dir, subfolder_name)
+            segment_folder_path = os.path.join(output_root, ship, subfolder_name)
             
             if os.path.exists(segment_folder_path):
                 continue  # 已经切片过的文件直接跳过
@@ -89,6 +92,7 @@ def Generate_Segments(dataset_dir, target_sr=16000, segment_length=5):
                 print(f"读取或处理文件 {file_name} 时出错: {e}")
 
     print(f"\n完美！成功处理了 {total_processed} 个原始音频文件。现在可以运行 demo_light.py 进行训练了！")
+    return output_root
 
 if __name__ == '__main__':
     # 确保这个路径指向包含 A,B,C,D,E 的目录

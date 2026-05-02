@@ -20,6 +20,7 @@ from scipy.io import wavfile
 import hashlib  
 import random  
 from Utils.MultiFeature_Extraction_Layer import MultiFeatureExtractor
+from Datasets.recording_bag_dataset import RecordingBagDataset
 
 def add_awgn(signal, snr_db, seed_string=None):
     """根据目标信噪比 (SNR) 注入绝对固定的高斯白噪声"""
@@ -272,7 +273,7 @@ class ShipsEarDataModule(L.LightningDataModule):
                  train_ratio=0.6, val_ratio=0.2, test_ratio=0.2, random_seed=42, 
                  normalize_waveform=False, split_file='shipsear_data_split.json', audit_file='split_audit_report.json',
                  test_snr=None, is_ssl=False, split_protocol='frame_level', segment_length=5,
-                 target_sr=16000, dataset_name=None):
+                 target_sr=16000, dataset_name=None, recording_bag_mode=False, clips_per_recording=4):
         super().__init__()
         
         assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-5, "🚨 比例之和必须等于 1.0"
@@ -294,6 +295,8 @@ class ShipsEarDataModule(L.LightningDataModule):
         self.segment_length = segment_length
         self.target_sr = target_sr
         self.dataset_name = dataset_name or os.path.basename(os.path.normpath(parent_folder)) or "Unknown"
+        self.recording_bag_mode = recording_bag_mode
+        self.clips_per_recording = clips_per_recording
         self.segment_lists = None
 
         self.train_dataset = None
@@ -633,6 +636,7 @@ class ShipsEarDataModule(L.LightningDataModule):
             normalize_waveform=self.normalize_waveform,
             snr_db=None,
             is_ssl=False,
+            return_path=True,
             **mipe_dataset_kwargs
         )
         self.test_dataset = ShipsEarDataset(
@@ -649,6 +653,23 @@ class ShipsEarDataModule(L.LightningDataModule):
             self.train_dataset.precompute_mipe_cache()
             self.val_dataset.precompute_mipe_cache()
             self.test_dataset.precompute_mipe_cache()
+
+        if self.recording_bag_mode:
+            self.train_dataset = RecordingBagDataset(
+                self.train_dataset,
+                clips_per_recording=self.clips_per_recording,
+                random_sample=True,
+            )
+            self.val_dataset = RecordingBagDataset(
+                self.val_dataset,
+                clips_per_recording=self.clips_per_recording,
+                random_sample=False,
+            )
+            self.test_dataset = RecordingBagDataset(
+                self.test_dataset,
+                clips_per_recording=self.clips_per_recording,
+                random_sample=False,
+            )
 
         self._print_and_verify_distributions(segment_lists, inverse_class_mapping, class_mapping)
         self._audit_recording_overlap(segment_lists, inverse_class_mapping, class_mapping, stage=stage)

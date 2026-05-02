@@ -121,7 +121,10 @@ def save_model_complexity(model_wrapper, Params, save_dir):
     segment_length = Params.get('segment_length', 5)
     hop_length = Params.get('hop_length', 512)
     t_dim = int((sample_rate * segment_length) / hop_length) + 1
-    input_shape = (1, 1, n_mels, t_dim)
+    if Params.get('Model_name') == 'ShuffleFAC_CLIPGRAPH':
+        input_shape = (1, Params.get('clips_per_recording', 4), 1, n_mels, t_dim)
+    else:
+        input_shape = (1, 1, n_mels, t_dim)
 
     target_model = model_wrapper.model
     total_params = sum(p.numel() for p in target_model.parameters())
@@ -224,15 +227,20 @@ def main(Params):
     数据集选择、split 协议、模型名称和训练超参数都在这里汇合。
     """
     model_name = Params['Model_name']
+    if model_name == 'ShuffleFAC_CLIPGRAPH':
+        Params['recording_bag_mode'] = True
     batch_size = Params['batch_size']
     num_workers = Params['num_workers']
     
     if Params['data_selection'] == 1:
-        dataset_dir = 'shipsEar_AUDIOS/' 
-        Generate_Segments(
-            dataset_dir,
+        src_dataset_dir = 'shipsEar_AUDIOS/'
+        seg_len = Params.get('segment_length', 5)
+        dataset_dir = src_dataset_dir if seg_len == 5 else f"shipsEar_AUDIOS_{seg_len}s/"
+        dataset_dir = Generate_Segments(
+            src_dataset_dir,
             target_sr=Params.get('sample_rate', 16000),
-            segment_length=Params.get('segment_length', 5)
+            segment_length=seg_len,
+            dest_dir=None if seg_len == 5 else dataset_dir,
         )
         data_module = ShipsEarDataModule(
             parent_folder=dataset_dir, 
@@ -247,7 +255,10 @@ def main(Params):
             segment_length=Params.get('segment_length', 5),
             split_file='shipsear_data_split.json', 
             audit_file='split_audit_report.json',
-            split_protocol=Params.get('split_protocol', 'recording_level')
+            split_protocol=Params.get('split_protocol', 'recording_level'),
+            random_seed=Params.get('split_seed', 42),
+            recording_bag_mode=Params.get('recording_bag_mode', False),
+            clips_per_recording=Params.get('clips_per_recording', 4)
         )
         configure_mipe_cache(data_module, Params)
         num_classes = 5 
@@ -284,7 +295,10 @@ def main(Params):
             segment_length=Params.get('segment_length', 5),
             split_file='deepship_data_split.json', 
             audit_file='deepship_audit_report.json',
-            split_protocol=Params.get('split_protocol', 'recording_level')
+            split_protocol=Params.get('split_protocol', 'recording_level'),
+            random_seed=Params.get('split_seed', 42),
+            recording_bag_mode=Params.get('recording_bag_mode', False),
+            clips_per_recording=Params.get('clips_per_recording', 4)
         )
         configure_mipe_cache(data_module, Params)
         DataName = "DeepShip"
@@ -304,13 +318,15 @@ def main(Params):
             f.write("Dataset,Model,ExpTime,Group,Run_Index,Seed,ACC,APR_Weighted,RE_Weighted,F1_Macro,F1_Weighted,Val_Macro_F1\n")
     
     numRuns = 1 if Params.get('test_only') else Params.get('num_runs', 3)
+    start_run_index = Params.get('run_index', 0)
     if Params.get('test_only'):
-        run_sequence = [Params.get('run_index', 0)]
+        run_sequence = [start_run_index]
     else:
-        run_sequence = range(numRuns)
+        run_sequence = range(start_run_index, start_run_index + numRuns)
 
     for run_number in run_sequence:
-        current_seed = run_number + 42
+        model_seed_base = Params.get('model_seed', 42)
+        current_seed = model_seed_base + run_number
         seed_everything(current_seed, workers=True)
         
         exp_folder_name = f"{DataName}_{Params['exp_time']}" if Params.get('exp_time') else DataName
@@ -324,7 +340,9 @@ def main(Params):
             "uatr_variant": Params.get('uatr_variant'),
             "run_index": run_number,
             "training_seed": current_seed,
+            "model_seed_base": model_seed_base,
             "split_random_seed": data_module.random_seed,
+            "split_seed": Params.get('split_seed', 42),
             "segment_length": Params.get('segment_length', 5),
             "split_protocol": Params.get('split_protocol', 'recording_level'),
             "train_ratio": Params.get('train_ratio', 0.6),
@@ -349,6 +367,7 @@ def main(Params):
             "mipe_cache_dir": Params.get('mipe_cache_dir'),
             "fusion_dim": Params.get('fusion_dim', 128),
             "fusion_dropout": Params.get('fusion_dropout', 0.2),
+            "dropout": Params.get('dropout', 0.2),
             "knn_k": Params.get('knn_k', 8),
             "uatr_depth": Params.get('uatr_depth', 1),
             "fa_target_freq": Params.get('fa_target_freq', 4),
@@ -358,6 +377,15 @@ def main(Params):
             "knn_source": Params.get('knn_source', 'pre_trans'),
             "gate_type": Params.get('gate_type', 'token'),
             "gate_init_bias": Params.get('gate_init_bias', -2.0),
+            "fusion_mode": Params.get('fusion_mode', 'gated'),
+            "recording_bag_mode": Params.get('recording_bag_mode', False),
+            "clips_per_recording": Params.get('clips_per_recording', 4),
+            "shufflefac_gamma": Params.get('shufflefac_gamma', 16),
+            "graph_hidden_dim": Params.get('graph_hidden_dim', 128),
+            "graph_layers": Params.get('graph_layers', 1),
+            "graph_k": Params.get('graph_k', 2),
+            "edge_mode": Params.get('edge_mode', 'temporal_similarity'),
+            "graph_pooling": Params.get('graph_pooling', 'attention'),
         }
         with open(os.path.join(save_dir, "model_config.json"), "w", encoding="utf-8") as f:
             json.dump(model_config, f, indent=2)
@@ -472,6 +500,10 @@ def parse_args():
     parser.add_argument('--train_ratio', type=float, default=0.6)
     parser.add_argument('--val_ratio', type=float, default=0.2)
     parser.add_argument('--test_ratio', type=float, default=0.2)
+    parser.add_argument('--split_seed', type=int, default=42,
+                        help='Random seed used only for train/val/test split generation')
+    parser.add_argument('--model_seed', type=int, default=42,
+                        help='Base random seed for model training; actual seed is model_seed + run_index')
     
     parser.add_argument('--use_graph', type=int, choices=[0, 1], default=1, help='1=True, 0=False')
     parser.add_argument('--use_prior_mask', type=int, choices=[0, 1], default=1, help='1=True, 0=False')
@@ -511,11 +543,24 @@ def parse_args():
     parser.add_argument('--uatr_depth', type=int, default=1)
     parser.add_argument('--fa_target_freq', type=int, default=4, choices=[1, 4, 8])
     parser.add_argument('--fa_arch', type=str, default='parallel', choices=['serial', 'parallel'])
-    parser.add_argument('--pos_type', type=str, default='2d', choices=['1d', '2d'])
+    parser.add_argument('--pos_type', type=str, default='2d', choices=['1d', '2d', 'none'])
     parser.add_argument('--knn_metric', type=str, default='cosine', choices=['l2', 'cosine'])
     parser.add_argument('--knn_source', type=str, default='pre_trans', choices=['pre_trans', 'post_trans'])
     parser.add_argument('--gate_type', type=str, default='token', choices=['scalar', 'token', 'element'])
     parser.add_argument('--gate_init_bias', type=float, default=-2.0)
+    parser.add_argument('--fusion_mode', type=str, default='gated',
+                        choices=['gated', 'trans_only', 'graph_only', 'fixed'])
+    parser.add_argument('--recording_bag_mode', action='store_true',
+                        help='Use recording-level bags instead of segment-level samples')
+    parser.add_argument('--clips_per_recording', type=int, default=4)
+    parser.add_argument('--shufflefac_gamma', type=int, default=16)
+    parser.add_argument('--graph_hidden_dim', type=int, default=128)
+    parser.add_argument('--graph_layers', type=int, default=1)
+    parser.add_argument('--graph_k', type=int, default=2)
+    parser.add_argument('--edge_mode', type=str, default='temporal_similarity',
+                        choices=['temporal', 'similarity', 'temporal_similarity'])
+    parser.add_argument('--graph_pooling', type=str, default='attention',
+                        choices=['mean', 'attention'])
 
     parser.add_argument('--test_snr', type=float, default=None, help='测试集注入的 SNR (dB)')
     # test_only 模式用于服务器上加载已有 ckpt 做鲁棒性/噪声测试，不触发训练。
