@@ -6,129 +6,120 @@
 train/val/test 划分，`model_seed + run_index` 控制训练随机性；因此并行跑
 `--run_index 0/1/2 --num_runs 1` 时，三次训练 seed 分别是 42/43/44，但 split 保持一致。
 
-## 当前主线：ShuffleFAC_CLIPGRAPH
+## 当前主线：external ShuffleFAC + recording-level aggregation
 
-当前不再继续优化 `FA_UATR_KNN_V2`，优先验证 recording-level aggregation：
+当前正式路线使用 `external/ShuffleFAC` 下的 ShuffleFAC native protocol：
 
-1. `ShuffleFAC` segment-level 训练/测试，同时输出 recording-level voting metrics。
-2. `ShuffleFAC_CLIPGRAPH` 使用同一 recording 的多个 3s clips 做图聚合。
-
-### DeepShip ShuffleFAC 3s / 7:1:2 + Recording Voting
-
-```bash
-CURRENT_TIME=$(date +"%m%d_%H%M")
-nohup python demo_light.py \
-  --model ShuffleFAC \
-  --data_selection 0 \
-  --split_protocol recording_level \
-  --segment_length 3 \
-  --train_ratio 0.7 \
-  --val_ratio 0.1 \
-  --test_ratio 0.2 \
-  --window_length 4096 \
-  --hop_length 2048 \
-  --number_mels 128 \
-  --sample_rate 16000 \
-  --train_batch_size 48 \
-  --val_batch_size 48 \
-  --test_batch_size 48 \
-  --num_workers 2 \
-  --num_epochs 200 \
-  --patience 200 \
-  --lr 1e-3 \
-  --dropout 0.2 \
-  --weight_decay 1e-5 \
-  --split_seed 42 \
-  --model_seed 42 \
-  --run_index 0 \
-  --num_runs 1 \
-  --exp_time "${CURRENT_TIME}_DeepShip_ShuffleFAC_3s_7_1_2_recording_eval" \
-  > run_deepship_shufflefac_3s_recording_eval.log 2>&1 &
+```text
+3s / 7:1:2 / strict recording-level split / 4096-2048 / 128 Mel / 16 kHz
 ```
 
-### DeepShip ShuffleFAC_CLIPGRAPH S=4
+当前主结果：
+
+- DeepShip：`ShuffleFAC` ordinary recording-level mean-logit voting。
+- ShipsEar：pretrained `ShuffleFAC` encoder + frozen deterministic multi-sample `AttentionHead`。
+- GNN 方向保留为消融：`GraphHead` 和 `Graph-aware AttentionHead`。
+
+不要把 from-scratch `ShuffleFAC_CLIPGRAPH`、`FA_UATR_KNN_V2` 或 5s demo_light 旧基线写成当前主线。
+
+### DeepShip current result path
+
+DeepShip 3-seed 已完成，当前主结果来自 ordinary recording-level mean-logit voting：
+
+| Seed | Checkpoint |
+| ---: | --- |
+| 42 | `results/ShuffleFAC/0502_External_ShuffleFAC_gamma16_multiseed_3s_7_1_2/seed_42/best.pt` |
+| 43 | `results/ShuffleFAC/0502_External_ShuffleFAC_gamma16_multiseed_3s_7_1_2/seed_43/best.pt` |
+| 44 | `results/ShuffleFAC/0502_External_ShuffleFAC_gamma16_multiseed_3s_7_1_2/seed_44_parallel/best.pt` |
+
+DeepShip 目前不需要用 learned head 替代 ordinary voting。若需要复核 GNN 消融，可运行 Graph-aware AttentionHead：
 
 ```bash
-CURRENT_TIME=$(date +"%m%d_%H%M")
-nohup python demo_light.py \
-  --model ShuffleFAC_CLIPGRAPH \
-  --recording_bag_mode \
-  --clips_per_recording 4 \
-  --data_selection 0 \
-  --split_protocol recording_level \
-  --segment_length 3 \
-  --train_ratio 0.7 \
-  --val_ratio 0.1 \
-  --test_ratio 0.2 \
-  --window_length 4096 \
-  --hop_length 2048 \
-  --number_mels 128 \
-  --sample_rate 16000 \
-  --train_batch_size 8 \
-  --val_batch_size 8 \
-  --test_batch_size 8 \
-  --num_workers 2 \
-  --num_epochs 200 \
-  --patience 200 \
-  --lr 1e-3 \
-  --dropout 0.2 \
-  --weight_decay 1e-5 \
-  --shufflefac_gamma 16 \
-  --graph_hidden_dim 128 \
-  --graph_layers 1 \
-  --graph_k 2 \
-  --edge_mode temporal_similarity \
-  --graph_pooling attention \
-  --split_seed 42 \
-  --model_seed 42 \
-  --run_index 0 \
-  --num_runs 1 \
-  --exp_time "${CURRENT_TIME}_DeepShip_ShuffleFAC_CLIPGRAPH_3s_7_1_2_S4_seed42" \
-  > run_deepship_shufflefac_clipgraph_s4_seed42.log 2>&1 &
+for item in \
+  "42 seed_42" \
+  "43 seed_43" \
+  "44 seed_44_parallel"
+do
+  set -- $item
+  SEED=$1
+  CKPT_DIR=$2
+  python -u external/ShuffleFAC/run_graphhead.py \
+    --encoder_ckpt results/ShuffleFAC/0502_External_ShuffleFAC_gamma16_multiseed_3s_7_1_2/${CKPT_DIR}/best.pt \
+    --model_config results/ShuffleFAC/0502_External_ShuffleFAC_gamma16_multiseed_3s_7_1_2/${CKPT_DIR}/model_config.json \
+    --head_type graph_aware_attention \
+    --edge_mode temporal_similarity \
+    --output_dir results/ShuffleFAC_GRAPHHEAD/DeepShip_seed${SEED}_graph_aware_attention_S8_ms5 \
+    --clips_per_recording 8 \
+    --batch_size 8 \
+    --epochs 50 \
+    --patience 20 \
+    --lr 1e-3 \
+    --weight_decay 1e-4 \
+    --dropout 0.2 \
+    --eval_samples 5 \
+    --seed ${SEED}
+done
 ```
 
-### ShipsEar ShuffleFAC_CLIPGRAPH S=4
+### ShipsEar current result path
+
+ShipsEar 当前主结果是 frozen encoder + deterministic multi-sample `AttentionHead`：
 
 ```bash
-CURRENT_TIME=$(date +"%m%d_%H%M")
-nohup python demo_light.py \
-  --model ShuffleFAC_CLIPGRAPH \
-  --recording_bag_mode \
-  --clips_per_recording 4 \
-  --data_selection 1 \
-  --split_protocol recording_level \
-  --segment_length 3 \
-  --train_ratio 0.7 \
-  --val_ratio 0.1 \
-  --test_ratio 0.2 \
-  --window_length 4096 \
-  --hop_length 2048 \
-  --number_mels 128 \
-  --sample_rate 16000 \
-  --train_batch_size 8 \
-  --val_batch_size 8 \
-  --test_batch_size 8 \
-  --num_workers 2 \
-  --num_epochs 200 \
-  --patience 200 \
-  --lr 1e-3 \
-  --dropout 0.2 \
-  --weight_decay 1e-5 \
-  --shufflefac_gamma 16 \
-  --graph_hidden_dim 128 \
-  --graph_layers 1 \
-  --graph_k 2 \
-  --edge_mode temporal_similarity \
-  --graph_pooling attention \
-  --split_seed 42 \
-  --model_seed 42 \
-  --run_index 0 \
-  --num_runs 1 \
-  --exp_time "${CURRENT_TIME}_ShipsEar_ShuffleFAC_CLIPGRAPH_3s_7_1_2_S4_seed42" \
-  > run_shipsear_shufflefac_clipgraph_s4_seed42.log 2>&1 &
+for SEED in 42 43 44
+do
+  python -u external/ShuffleFAC/run_graphhead.py \
+    --encoder_ckpt results/ShuffleFAC/0502_External_ShuffleFAC_ShipsEar_gamma16_multiseed_3s_7_1_2/seed_${SEED}/best.pt \
+    --model_config results/ShuffleFAC/0502_External_ShuffleFAC_ShipsEar_gamma16_multiseed_3s_7_1_2/seed_${SEED}/model_config.json \
+    --head_type attention \
+    --output_dir results/ShuffleFAC_GRAPHHEAD/ShipsEar_seed${SEED}_attention_S8_ms5 \
+    --clips_per_recording 8 \
+    --batch_size 8 \
+    --epochs 50 \
+    --patience 20 \
+    --lr 1e-3 \
+    --weight_decay 1e-4 \
+    --dropout 0.2 \
+    --eval_samples 5 \
+    --seed ${SEED}
+done
 ```
 
-## FA_UATR_KNN_V2 历史命令
+ShipsEar GNN-guided ablation 使用 `graph_aware_attention`：
+
+```bash
+for SEED in 42 43 44
+do
+  python -u external/ShuffleFAC/run_graphhead.py \
+    --encoder_ckpt results/ShuffleFAC/0502_External_ShuffleFAC_ShipsEar_gamma16_multiseed_3s_7_1_2/seed_${SEED}/best.pt \
+    --model_config results/ShuffleFAC/0502_External_ShuffleFAC_ShipsEar_gamma16_multiseed_3s_7_1_2/seed_${SEED}/model_config.json \
+    --head_type graph_aware_attention \
+    --edge_mode temporal_similarity \
+    --output_dir results/ShuffleFAC_GRAPHHEAD/ShipsEar_seed${SEED}_graph_aware_attention_S8_ms5 \
+    --clips_per_recording 8 \
+    --batch_size 8 \
+    --epochs 50 \
+    --patience 20 \
+    --lr 1e-3 \
+    --weight_decay 1e-4 \
+    --dropout 0.2 \
+    --eval_samples 5 \
+    --seed ${SEED}
+done
+```
+
+### Frozen head settings
+
+`run_graphhead.py` 默认遵循当前主线要求：
+
+- 加载 external ShuffleFAC `best.pt`。
+- 冻结 ShuffleFAC encoder，只训练 recording-level head。
+- train 随机采样 `clips_per_recording=8`。
+- val/test 使用 deterministic temporal phase sampling。
+- `--eval_samples 5` 时，对同一 recording 做 5 个确定性 bags，平均 logits 后计算 recording metrics。
+- 输出 `attn_entropy`、`graph_delta_norm`、`graph_res_scale`、trainable/frozen params。
+
+## 暂停路线：FA_UATR_KNN_V2 历史命令
 
 以下命令仅作为历史记录保留；当前主线不再继续投入 `FA_UATR_KNN_V2`。
 若需要复现旧消融，原建议顺序为：
@@ -259,7 +250,11 @@ nohup python demo_light.py \
   > run_shipsear_fa_uatr_knn_v2_200epoch.log 2>&1 &
 ```
 
-## DeepShip UATR_KNN-C
+## 历史基线命令（非当前主线）
+
+以下 5s `demo_light.py` 命令仅用于复现旧基线或补充附录，不是当前推荐主线。
+
+### DeepShip UATR_KNN-C
 
 ```bash
 CURRENT_TIME=$(date +"%m%d_%H%M")
@@ -290,7 +285,7 @@ nohup python demo_light.py \
   > run_deepship_uatr_knn_c.log 2>&1 &
 ```
 
-## DeepShip ShuffleFAC
+### DeepShip ShuffleFAC
 
 ```bash
 CURRENT_TIME=$(date +"%m%d_%H%M")
@@ -320,7 +315,7 @@ nohup python demo_light.py \
   > run_deepship_shufflefac.log 2>&1 &
 ```
 
-## ShipsEar UATR_KNN-C
+### ShipsEar UATR_KNN-C
 
 ```bash
 CURRENT_TIME=$(date +"%m%d_%H%M")
@@ -351,7 +346,7 @@ nohup python demo_light.py \
   > run_shipsear_uatr_knn_c_7_1_2.log 2>&1 &
 ```
 
-## ShipsEar ShuffleFAC
+### ShipsEar ShuffleFAC
 
 ```bash
 CURRENT_TIME=$(date +"%m%d_%H%M")
@@ -381,7 +376,7 @@ nohup python demo_light.py \
   > run_shipsear_shufflefac_7_1_2.log 2>&1 &
 ```
 
-## 后续 DeepShip FA_UATR_KNN
+### 暂停：DeepShip FA_UATR_KNN
 
 ```bash
 CURRENT_TIME=$(date +"%m%d_%H%M")
@@ -414,7 +409,7 @@ nohup python demo_light.py \
   > run_deepship_fa_uatr_knn.log 2>&1 &
 ```
 
-## 后续 ShipsEar FA_UATR_KNN
+### 暂停：ShipsEar FA_UATR_KNN
 
 ```bash
 CURRENT_TIME=$(date +"%m%d_%H%M")
