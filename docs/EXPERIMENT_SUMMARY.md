@@ -267,3 +267,167 @@ ShipsEar 上没有发现比 `mean_logits` 更稳的 aggregation method。Validat
 `mean_logits`、`topk_confident_logits_50`、`entropy_filtered_logits` 和
 `trimmed_mean_logits` 并列，但 test 上没有带来稳定提升；ShipsEar 的主要问题仍是
 seed/split sensitivity 和 recording 数量较少，而不是简单聚合函数选择。
+
+## 13. UATR_KNN-C native 3s/7:1:2 seed42 sanity
+
+Setting: `3s / 7:1:2 / 4096-2048 / 128 Mel / 16 kHz / strict recording-level split`.
+This is a seed42 sanity run with `patience=40` to verify the native-protocol command,
+recording-level metrics, and split audit before launching any 3-seed run.
+
+| Dataset | Seed | Segment ACC | Segment Macro-F1 | Segment Weighted-F1 | Recording ACC | Recording Macro-F1 | Recording Weighted-F1 | Params | MACs | Latency |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| DeepShip | 42 | 0.6235 | 0.6213 | 0.6220 | 0.7131 | 0.6698 | 0.7071 | 362,740 | 6.507M | 1.322 ms |
+| ShipsEar | 42 | 0.7015 | 0.6583 | 0.7024 | 0.6667 | 0.6429 | 0.6455 | 362,837 | 6.507M | 1.345 ms |
+
+Split audit: both runs have `train-val`, `train-test`, and `val-test` recording overlap = 0.
+
+结论：UATR_KNN-C native seed42 的命令和 recording-level metrics 均已跑通。DeepShip 上
+seed42 recording Macro-F1 = 0.6698，低于 ShuffleFAC native + mean-logit voting 的
+3-seed mean 0.7729；因此 DeepShip 当前仍应以 ShuffleFAC + recording-level voting
+作为主结果。ShipsEar seed42 的 UATR_KNN-C recording Macro-F1 = 0.6429，略高于
+ShuffleFAC voting seed42 但仍需 3-seed 才能判断稳定性。
+
+## 14. ShuffleFAC_GRAPHHEAD sanity
+
+Setting: DeepShip seed42, pretrained external ShuffleFAC `best.pt`, frozen encoder,
+`clips_per_recording=8`, `3s / 7:1:2 / 4096-2048 / 128 Mel / 16 kHz`,
+`batch_size=8`, `lr=1e-3`, `weight_decay=1e-4`, `num_epochs=50`, `patience=20`.
+
+Pretrained checkpoint:
+`results/ShuffleFAC/0502_External_ShuffleFAC_gamma16_multiseed_3s_7_1_2/seed_42/best.pt`
+
+Ordinary ShuffleFAC mean-logit voting baseline for this seed:
+Recording Macro-F1 = 0.7628.
+
+| Head | Best Val Macro-F1 | Test Recording ACC | Test Recording Macro-F1 | Test Recording Weighted-F1 | attn_entropy | graph_delta_norm | graph_res_scale | Trainable Params | Frozen Params |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Attention | 0.8518 | 0.7541 | 0.7619 | 0.7536 | 1.8525 | - | - | 9,093 | 39,031 |
+| Graph | 0.8664 | 0.7787 | 0.7844 | 0.7795 | 1.9976 | 2.3707 | 0.1956 | 58,758 | 39,031 |
+
+结论：Attention head 几乎追平 ordinary voting，但未超过 seed42 baseline。Graph head
+超过 attention head，并超过 ordinary voting baseline，说明在 frozen ShuffleFAC embedding
+上做 lightweight graph relation aggregation 有初步价值。下一步应优先在 ShipsEar seed42/44
+验证该方向是否能缓解 voting instability，而不是回到 from-scratch ClipGraph 或继续 V2。
+
+## 15. ShuffleFAC_GRAPHHEAD deterministic multi-sample evaluation
+
+Implementation note: validation/test sampling is deterministic. The default evaluation uses evenly
+spaced `S=8` clips per recording. The multi-sample setting uses `eval_samples=5`, where each recording
+is evaluated with five deterministic temporal phases and logits are averaged before computing
+recording-level metrics. Strategy selection is still based on validation metrics, not test metrics.
+
+### DeepShip 3-seed, frozen encoder, `eval_samples=5`
+
+| Seed | Ordinary Voting Macro-F1 | Attention Best Val | Attention Test Macro-F1 | Attention ACC | Graph Best Val | Graph Test Macro-F1 | Graph ACC | Graph Delta Norm | Graph Res Scale |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 42 | 0.7628 | 0.8650 | 0.8328 | 0.8279 | 0.8547 | 0.8013 | 0.7951 | 3.3087 | 0.2640 |
+| 43 | 0.7804 | 0.8584 | 0.7449 | 0.7541 | 0.8756 | 0.7672 | 0.7787 | 3.0520 | 0.2453 |
+| 44 | 0.7757 | 0.8822 | 0.7355 | 0.7459 | 0.8564 | 0.7437 | 0.7459 | 2.7454 | 0.2200 |
+
+| Method | Mean Test Recording Macro-F1 | Sample Std |
+| --- | ---: | ---: |
+| Ordinary voting | 0.7730 | 0.0091 |
+| AttentionHead | 0.7711 | 0.0537 |
+| GraphHead | 0.7707 | 0.0290 |
+
+结论：DeepShip 上 GraphHead 没有稳定超过 ordinary voting。GraphHead 相比 AttentionHead
+更稳，但均值仍略低于 ordinary voting；因此 DeepShip 主结果仍保留 ShuffleFAC native
+mean-logit voting。
+
+### DeepShip Graph-aware AttentionHead 3-seed
+
+Graph-aware AttentionHead uses graph context only to compute clip attention weights:
+`attn_score = MLP(concat(z, graph_context))`, while the final recording embedding
+still pools the original frozen ShuffleFAC clip embeddings `z`.
+
+| Seed | Ordinary Voting Macro-F1 | Graph-aware Best Val | Graph-aware Test Macro-F1 | Graph-aware ACC | attn_entropy | graph_delta_norm | graph_res_scale |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 42 | 0.7628 | 0.8410 | 0.7896 | 0.7951 | 1.5346 | 1.6210 | 0.1549 |
+| 43 | 0.7804 | 0.8624 | 0.7541 | 0.7705 | 1.4627 | 1.9266 | 0.2030 |
+| 44 | 0.7757 | 0.8720 | 0.7737 | 0.7787 | 1.2230 | 1.7905 | 0.2096 |
+
+| Method | Mean Test Recording Macro-F1 | Sample Std |
+| --- | ---: | ---: |
+| Ordinary voting | 0.7730 | 0.0091 |
+| AttentionHead | 0.7711 | 0.0537 |
+| GraphHead | 0.7707 | 0.0290 |
+| Graph-aware AttentionHead | 0.7725 | 0.0178 |
+
+结论：DeepShip Graph-aware AttentionHead 几乎追平 ordinary voting，但没有超过，
+且方差没有低于 ordinary voting。因此 DeepShip 主结果仍保留 ShuffleFAC native
+mean-logit voting；Graph-aware AttentionHead 可作为接近主结果的 GNN 消融。
+
+### ShipsEar seed42/44, frozen encoder, `eval_samples=5`
+
+| Seed | Ordinary Voting Macro-F1 | Attention Best Val | Attention Test Macro-F1 | Attention ACC | Graph Best Val | Graph Test Macro-F1 | Graph ACC | Graph Delta Norm | Graph Res Scale |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 42 | 0.5505 | 0.8200 | 0.5933 | 0.6842 | 0.8200 | 0.5588 | 0.6316 | 2.5870 | 0.2094 |
+| 44 | 0.5867 | 0.9048 | 0.7148 | 0.7368 | 0.9048 | 0.7148 | 0.7368 | 1.3232 | 0.1158 |
+
+| Method | Mean Test Recording Macro-F1 | Sample Std |
+| --- | ---: | ---: |
+| Ordinary voting | 0.5686 | 0.0256 |
+| AttentionHead | 0.6540 | 0.0859 |
+| GraphHead | 0.6368 | 0.1103 |
+
+结论：ShipsEar seed42/44 上 learned aggregation 明显高于 ordinary voting，尤其
+AttentionHead 更强。GraphHead 没有超过 AttentionHead；当前证据更支持 frozen
+ShuffleFAC encoder + deterministic multi-sample AttentionHead，而不是更复杂的 graph head。
+
+### ShipsEar AttentionHead 3-seed completion
+
+| Seed | Ordinary Voting Macro-F1 | Attention Best Val | Attention Test Macro-F1 | Attention ACC | attn_entropy |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 42 | 0.5505 | 0.8200 | 0.5933 | 0.6842 | 1.9685 |
+| 43 | 0.7394 | 0.8933 | 0.7548 | 0.7895 | 2.0409 |
+| 44 | 0.5867 | 0.9048 | 0.7148 | 0.7368 | 2.0470 |
+
+| Method | Mean Test Recording Macro-F1 | Sample Std |
+| --- | ---: | ---: |
+| Ordinary voting | 0.6255 | 0.1003 |
+| AttentionHead | 0.6876 | 0.0841 |
+
+结论：ShipsEar 上 frozen ShuffleFAC encoder + deterministic multi-sample AttentionHead
+相对 ordinary voting 同时提升均值并降低方差，是当前最值得保留的 recording-level
+aggregation 方向。
+
+### ShipsEar GraphHead 3-seed completion
+
+| Seed | Ordinary Voting Macro-F1 | Graph Best Val | Graph Test Macro-F1 | Graph ACC | attn_entropy | graph_delta_norm | graph_res_scale |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 42 | 0.5505 | 0.8200 | 0.5588 | 0.6316 | 1.8772 | 2.5870 | 0.2094 |
+| 43 | 0.7394 | 0.9048 | 0.6333 | 0.6842 | 2.0677 | 1.3241 | 0.1161 |
+| 44 | 0.5867 | 0.9048 | 0.7148 | 0.7368 | 2.0595 | 1.3232 | 0.1158 |
+
+| Method | Mean Test Recording Macro-F1 | Sample Std |
+| --- | ---: | ---: |
+| Ordinary voting | 0.6255 | 0.1003 |
+| AttentionHead | 0.6876 | 0.0841 |
+| GraphHead | 0.6356 | 0.0780 |
+
+结论：ShipsEar GraphHead 3-seed 均值略高于 ordinary voting，方差更低，但明显低于
+AttentionHead。当前不支持引入 graph relation 作为主线；更合理的主线是 frozen
+ShuffleFAC encoder + deterministic multi-sample AttentionHead。
+
+### ShipsEar Graph-aware AttentionHead 3-seed
+
+Graph-aware AttentionHead uses graph context only to compute clip attention weights:
+`attn_score = MLP(concat(z, graph_context))`, while the final recording embedding
+still pools the original frozen ShuffleFAC clip embeddings `z`.
+
+| Seed | Ordinary Voting Macro-F1 | Graph-aware Best Val | Graph-aware Test Macro-F1 | Graph-aware ACC | attn_entropy | graph_delta_norm | graph_res_scale |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 42 | 0.5505 | 0.8933 | 0.5600 | 0.6316 | 1.5729 | 1.9621 | 0.1778 |
+| 43 | 0.7394 | 0.8933 | 0.7548 | 0.7895 | 1.8548 | 1.3261 | 0.1193 |
+| 44 | 0.5867 | 0.9048 | 0.7148 | 0.7368 | 1.8737 | 1.3384 | 0.1204 |
+
+| Method | Mean Test Recording Macro-F1 | Sample Std |
+| --- | ---: | ---: |
+| Ordinary voting | 0.6255 | 0.1003 |
+| AttentionHead | 0.6876 | 0.0841 |
+| GraphHead | 0.6356 | 0.0780 |
+| Graph-aware AttentionHead | 0.6765 | 0.1029 |
+
+结论：Graph-aware AttentionHead 高于 ordinary voting，但低于 AttentionHead，且方差没有降低。
+因此 GNN 当前只能作为消融保留；ShipsEar 主线仍是 frozen ShuffleFAC encoder +
+deterministic multi-sample AttentionHead。

@@ -40,8 +40,49 @@ val-test recording overlap = 0
 - 人工特征直接输入路线整体效果较弱。
 - MIPE 加入后没有带来稳定提升。
 - `UATR_KNN-C` 的 Transformer 与 KNN-GNN 组合有一定 patch 关系建模价值。
-- `ShuffleFAC` 的 FA/FASC block 在 DeepShip 和 ShipsEar 上都表现更强，尤其 ShipsEar 的 Macro-F1 提升明显。
+- `external/ShuffleFAC` 官方风格实现与工程内集成版 `src/models/shufflefac.py` 需要分开记录；当前复核显示 external ShuffleFAC 在 DeepShip `3s / 7:1:2` 下非常稳定。
 - 后续应优先探索 `FA block + UATR_KNN` 的融合模型，而不是继续扩大 MFCC / MIPE / REG 路线。
+
+## External ShuffleFAC 复核结果
+
+以下结果均来自 `external/ShuffleFAC/run_deepship.py`，使用 `strict recording-level split`，
+`segment_length=3`，`train/val/test=0.7/0.1/0.2`，`split_seed=42`，
+训练种子为 `42/43/44`，特征参数为 `n_fft/win_length/hop_length/n_mels = 4096/4096/2048/128`。
+所有 split audit 均为 recording overlap = 0。
+
+### DeepShip
+
+结果目录：`results/ShuffleFAC/0502_External_ShuffleFAC_gamma16_multiseed_3s_7_1_2`
+
+| Seed | ACC | Macro-F1 | Weighted-F1 |
+| ---: | ---: | ---: | ---: |
+| 42 | 0.6829 | 0.6812 | 0.6828 |
+| 43 | 0.6870 | 0.6868 | 0.6867 |
+| 44 | 0.6831 | 0.6825 | 0.6845 |
+
+- Mean ACC = 0.6843
+- Mean Macro-F1 = 0.6835
+- Sample Std Macro-F1 = 0.0029
+- Mean Weighted-F1 = 0.6847
+- Params = 39,031
+- MACs = 2.585M
+
+### ShipsEar
+
+结果目录：`results/ShuffleFAC/0502_External_ShuffleFAC_ShipsEar_gamma16_multiseed_3s_7_1_2`
+
+| Seed | ACC | Macro-F1 | Weighted-F1 |
+| ---: | ---: | ---: | ---: |
+| 42 | 0.7073 | 0.5816 | 0.6892 |
+| 43 | 0.7952 | 0.7059 | 0.7896 |
+| 44 | 0.7412 | 0.6314 | 0.7295 |
+
+- Mean ACC = 0.7479
+- Mean Macro-F1 = 0.6396
+- Sample Std Macro-F1 = 0.0626
+- Mean Weighted-F1 = 0.7361
+- Params = 39,160
+- MACs = 2.585M
 
 ## 文档入口
 
