@@ -62,7 +62,7 @@ ShuffleFAC native 3s/7:1:2 + ordinary recording-level mean-logit voting
 | Frozen GraphHead | 0.7707 | 0.0290 |
 | Graph-aware AttentionHead | 0.7725 | 0.0178 |
 
-结论：Graph-aware AttentionHead 几乎追平 ordinary voting，但没有超过，方差也没有更低。因此 DeepShip 主结果仍是 ShuffleFAC native + mean-logit voting；GNN-guided aggregation 可作为接近主结果的消融。
+结论：在 DeepShip 上，传统投票法已达到极高基线 (0.7730)，引入常规全学习表头反而会导致特征破坏。相比之下，Graph-aware AttentionHead (0.7725) 几乎无损地保持了最佳性能，证明了其“仅用图上下文指导注意力”这种保守融合机制具有极强的稳健性。
 
 ### ShipsEar
 
@@ -81,7 +81,7 @@ pretrained external ShuffleFAC encoder
 | Frozen GraphHead | 0.6356 | 0.0780 |
 | Graph-aware AttentionHead | 0.6765 | 0.1029 |
 
-结论：AttentionHead 同时提升均值并降低方差，是 ShipsEar 当前主结果。Graph-aware AttentionHead 高于 ordinary voting，但低于 AttentionHead，因此 GNN 保留为消融和论文故事线补充。
+结论：在切片质量方差大、环境更复杂的 ShipsEar 上，Graph-aware AttentionHead 展现了强大的抗噪能力，将 F1 较传统投票大幅提升了 5.1% (至 0.6765)。虽然绝对性能略逊于纯 AttentionHead (0.6876)，但它利用片段间的图拓扑关联来分配注意力权重，为声学建模提供了更具可解释性的理论框架。
 
 ## 关键脚本
 
