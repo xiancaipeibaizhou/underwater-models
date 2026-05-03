@@ -357,6 +357,67 @@ still pools the original frozen ShuffleFAC clip embeddings `z`.
 且方差没有低于 ordinary voting。因此 DeepShip 主结果仍保留 ShuffleFAC native
 mean-logit voting；Graph-aware AttentionHead 可作为接近主结果的 GNN 消融。
 
+### DeepShip Graph-aware complementarity and late fusion
+
+Setting: eval-only analysis. No retraining. Ordinary voting logits come from external ShuffleFAC
+mean-logit aggregation over all test clips of each recording. Graph-aware logits come from the frozen
+ShuffleFAC encoder + Graph-aware AttentionHead with deterministic `eval_samples=5`.
+
+Outputs are saved under:
+`results/ShuffleFAC_GRAPHHEAD/0503_DeepShip_graphaware_fusion_analysis/`
+
+#### Error complementarity
+
+| Seed | Ordinary Macro-F1 | Graph-aware Macro-F1 | both_correct | voting_only_correct | graph_only_correct | both_wrong |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 42 | 0.7628 | 0.7896 | 93 | 1 | 4 | 24 |
+| 43 | 0.7804 | 0.7541 | 93 | 3 | 1 | 25 |
+| 44 | 0.7757 | 0.7737 | 89 | 5 | 6 | 22 |
+| Total | - | - | 275 | 9 | 11 | 71 |
+
+Mean per-class F1 across seeds:
+
+| Class | Ordinary Voting F1 | Graph-aware F1 | Delta |
+| --- | ---: | ---: | ---: |
+| Cargo | 0.6660 | 0.7011 | +0.0352 |
+| Passengership | 0.8001 | 0.7900 | -0.0101 |
+| Tanker | 0.7920 | 0.8073 | +0.0153 |
+| Tug | 0.8338 | 0.7914 | -0.0424 |
+
+结论：`graph_only_correct=11` and `voting_only_correct=9` over 366 total test recordings, so
+Graph-aware AttentionHead does recover a small number of recordings missed by ordinary voting.
+The gains are mainly on Cargo and Tanker, while Tug drops.
+
+#### Validation-selected late fusion
+
+Late fusion uses:
+
+```text
+final_logits = (1 - lambda) * ordinary_logits + lambda * graph_logits
+lambda_grid = [0.0, 0.1, ..., 1.0]
+```
+
+`lambda` is selected only by validation Macro-F1, then evaluated once on test.
+
+| Seed | Best lambda by val | Fusion Val Macro-F1 | Fusion Test ACC | Fusion Test Macro-F1 | Fusion Test Weighted-F1 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 42 | 0.0 | 0.8650 | 0.7705 | 0.7628 | 0.7708 |
+| 43 | 1.0 | 0.8624 | 0.7705 | 0.7541 | 0.7690 |
+| 44 | 0.8 | 0.8845 | 0.7787 | 0.7781 | 0.7782 |
+
+| Method | Mean Test Recording Macro-F1 | Sample Std |
+| --- | ---: | ---: |
+| Ordinary voting | 0.7729 | 0.0091 |
+| Graph-aware AttentionHead | 0.7725 | 0.0178 |
+| Validation-selected late fusion | 0.7650 | 0.0122 |
+
+结论：late fusion did not improve over ordinary voting. The selected lambdas are unstable
+(`0.0 / 1.0 / 0.8`), and validation selection overfits to the learned head on seed43.
+Therefore, current evidence shows limited complementarity: Graph-aware AttentionHead can recover
+some ordinary-voting errors, but not enough to improve validation-selected 3-seed fusion. DeepShip
+main result remains ordinary recording-level mean-logit voting; GNN remains a close ablation rather
+than the main innovation.
+
 ### ShipsEar seed42/44, frozen encoder, `eval_samples=5`
 
 | Seed | Ordinary Voting Macro-F1 | Attention Best Val | Attention Test Macro-F1 | Attention ACC | Graph Best Val | Graph Test Macro-F1 | Graph ACC | Graph Delta Norm | Graph Res Scale |
