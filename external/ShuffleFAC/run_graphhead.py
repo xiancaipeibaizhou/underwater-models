@@ -6,10 +6,12 @@ only a small recording-level aggregation head over bags of cached 3s clips.
 """
 
 import argparse
+import atexit
 import csv
 import json
 import math
 import random
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -21,6 +23,49 @@ from sklearn.metrics import accuracy_score, f1_score
 from torch.utils.data import DataLoader, Dataset
 
 from model.shuffleFAC import shuffleFAC
+
+
+class TeeStream:
+    def __init__(self, *streams):
+        self.streams = streams
+        self.encoding = getattr(streams[0], "encoding", "utf-8") if streams else "utf-8"
+        self.errors = getattr(streams[0], "errors", "replace") if streams else "replace"
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+    def isatty(self):
+        return bool(self.streams and self.streams[0].isatty())
+
+    def __getattr__(self, name):
+        return getattr(self.streams[0], name)
+
+
+def install_run_log(output_dir: Path):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = output_dir / "run.log"
+    log_file = log_path.open("w", encoding="utf-8")
+    sys.stdout = TeeStream(sys.__stdout__, log_file)
+    sys.stderr = TeeStream(sys.__stderr__, log_file)
+
+    def close_log():
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            sys.stdout = sys.__stdout__
+            sys.stderr = sys.__stderr__
+            log_file.close()
+
+    atexit.register(close_log)
+    print(f"run log: {log_path}", flush=True)
+    print(f"command: {' '.join(sys.argv)}", flush=True)
+    return log_path
 
 
 def resolve_path(path: str, root: Path) -> Path:
@@ -458,6 +503,7 @@ def main():
     root = Path.cwd()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    install_run_log(output_dir)
 
     random.seed(args.seed)
     np.random.seed(args.seed)

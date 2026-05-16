@@ -60,6 +60,15 @@ pip install -r requirements.txt
 
 ## 🚀 Usage
 
+For the adapted training entry points in this workspace, logs are written inside
+the model output directory:
+
+* `run_deepship.py` writes to `--output_dir/run.log`
+* `run_graphhead.py` writes to `--output_dir/run.log`
+
+Do not redirect current ShuffleFAC/GraphHEAD runs to root-level files such as
+`run_*.log`; keep each log with the checkpoint and metrics it describes.
+
 ### Train & Evaluation
 
 ```bash

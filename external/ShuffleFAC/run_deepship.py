@@ -1,4 +1,5 @@
 import argparse
+import atexit
 import csv
 import hashlib
 import json
@@ -6,6 +7,7 @@ import math
 import os
 import random
 import shutil
+import sys
 import time
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -44,6 +46,49 @@ DATASET_CLASS_MAPPINGS = {
 CLASS_MAPPING = DATASET_CLASS_MAPPINGS["DeepShip"]
 INV_CLASS_MAPPING = {v: k for k, v in CLASS_MAPPING.items()}
 DISABLE_PROGRESS = False
+
+
+class TeeStream:
+    def __init__(self, *streams):
+        self.streams = streams
+        self.encoding = getattr(streams[0], "encoding", "utf-8") if streams else "utf-8"
+        self.errors = getattr(streams[0], "errors", "replace") if streams else "replace"
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+    def isatty(self):
+        return bool(self.streams and self.streams[0].isatty())
+
+    def __getattr__(self, name):
+        return getattr(self.streams[0], name)
+
+
+def install_run_log(output_dir: Path):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = output_dir / "run.log"
+    log_file = log_path.open("w", encoding="utf-8")
+    sys.stdout = TeeStream(sys.__stdout__, log_file)
+    sys.stderr = TeeStream(sys.__stderr__, log_file)
+
+    def close_log():
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            sys.stdout = sys.__stdout__
+            sys.stderr = sys.__stderr__
+            log_file.close()
+
+    atexit.register(close_log)
+    print(f"run log: {log_path}", flush=True)
+    print(f"command: {' '.join(sys.argv)}", flush=True)
+    return log_path
 
 
 def repo_root_from_script() -> Path:
@@ -1192,6 +1237,8 @@ def main():
 
     data_root = Path(args.data_root)
     output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    install_run_log(output_dir)
     split_payload, created_split = load_or_create_split(args, data_root)
     print(f"split json: {args.split_json} ({'created' if created_split else 'reused'})", flush=True)
 
