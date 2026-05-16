@@ -45,6 +45,8 @@ SHIPSEAR_CLASS_NAMES = ["A", "B", "C", "D", "E"]
 
 
 class TeeStream:
+    """Mirror writes to the original console stream and a run.log file."""
+
     def __init__(self, *streams):
         self.streams = streams
         self.encoding = getattr(streams[0], "encoding", "utf-8") if streams else "utf-8"
@@ -66,6 +68,8 @@ class TeeStream:
 
 
 def install_run_log(output_dir: Path):
+    """Capture stdout/stderr in output_dir/run.log while keeping console output."""
+
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = output_dir / "run.log"
     log_file = log_path.open("w", encoding="utf-8")
@@ -87,6 +91,8 @@ def install_run_log(output_dir: Path):
 
 
 def torch_load(path: Path, map_location="cpu"):
+    """Load torch checkpoints across PyTorch versions."""
+
     try:
         return torch.load(path, map_location=map_location, weights_only=False)
     except TypeError:
@@ -94,16 +100,22 @@ def torch_load(path: Path, map_location="cpu"):
 
 
 def load_json(path: Path) -> dict:
+    """Read a UTF-8 JSON file."""
+
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def write_json(path: Path, payload: dict):
+    """Write JSON with stable indentation and UTF-8 text."""
+
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
 def expand_encoder_ckpts(value: str, root: Path):
+    """Expand comma-separated files, globs, and directories into best.pt paths."""
+
     paths = []
     for part in [p.strip() for p in str(value).split(",") if p.strip()]:
         if any(ch in part for ch in "*?[]"):
@@ -125,12 +137,16 @@ def expand_encoder_ckpts(value: str, root: Path):
 
 
 def checkpoint_args(checkpoint: dict):
+    """Return checkpoint args when present, otherwise an empty dict."""
+
     if isinstance(checkpoint, dict) and isinstance(checkpoint.get("args"), dict):
         return checkpoint["args"]
     return {}
 
 
 def pick(cli_value, checkpoint_args_dict: dict, name: str, default):
+    """Prefer CLI values, then checkpoint args, then a hard default."""
+
     if cli_value is not None:
         return cli_value
     if isinstance(checkpoint_args_dict, dict) and checkpoint_args_dict.get(name) is not None:
@@ -139,6 +155,8 @@ def pick(cli_value, checkpoint_args_dict: dict, name: str, default):
 
 
 def infer_model_config(encoder_ckpt: Path, root: Path, model_config_arg: str) -> Path:
+    """Locate the first-stage model_config.json that stores recording cache paths."""
+
     if str(model_config_arg).lower() != "auto":
         return resolve_path(model_config_arg, root)
     candidate = encoder_ckpt.parent / "model_config.json"
@@ -148,6 +166,8 @@ def infer_model_config(encoder_ckpt: Path, root: Path, model_config_arg: str) ->
 
 
 def resolve_cache_paths(config: dict, root: Path) -> dict:
+    """Resolve train/val/test cache paths from model_config.json."""
+
     cache_paths = config.get("cache_paths")
     if not isinstance(cache_paths, dict):
         raise ValueError("model_config must contain cache_paths")
@@ -158,6 +178,8 @@ def resolve_cache_paths(config: dict, root: Path) -> dict:
 
 
 def validate_recording_cache(cache_path: Path, split_name: str):
+    """Reject frame-level or split-mismatched caches before training/evaluation."""
+
     payload = torch_load(cache_path, map_location="cpu")
     metadata = payload.get("metadata", {})
     protocol = metadata.get("protocol")
@@ -170,6 +192,8 @@ def validate_recording_cache(cache_path: Path, split_name: str):
 
 
 def infer_dataset_name(dataset_arg: str, config: dict, encoder_ckpt: Path, num_classes: int):
+    """Infer DeepShip or ShipsEar from config metadata, path text, or class count."""
+
     if dataset_arg != "auto":
         return dataset_arg
     split_meta = config.get("split_metadata", {})
@@ -187,6 +211,8 @@ def infer_dataset_name(dataset_arg: str, config: dict, encoder_ckpt: Path, num_c
 
 
 def class_names_for(dataset_name: str, num_classes: int):
+    """Return dataset-specific class names or generic class_i names."""
+
     if dataset_name == "DeepShip" and num_classes == 4:
         return DEEPSHIP_CLASS_NAMES
     if dataset_name == "ShipsEar" and num_classes == 5:
@@ -319,6 +345,8 @@ class NoiseGraphAttentionHead(nn.Module):
 
 
 class SignalNoiseDecoupledModel(nn.Module):
+    """Frozen ShuffleFAC encoder plus trainable signal/noise decoupled head."""
+
     def __init__(
         self,
         encoder: FrozenShuffleFACEncoder,
@@ -358,6 +386,8 @@ class SignalNoiseDecoupledModel(nn.Module):
             param.requires_grad = False
 
     def encode_nodes(self, clips):
+        """Encode clip bags with the frozen ShuffleFAC CNN under no_grad."""
+
         b, s, c, f, t = clips.shape
         flat = clips.reshape(b * s, c, f, t)
         with torch.no_grad():
@@ -365,6 +395,8 @@ class SignalNoiseDecoupledModel(nn.Module):
         return emb.detach()
 
     def forward(self, clips, return_parts: bool = False):
+        """Classify a recording bag after noise-conditioned signal masking."""
+
         z = self.encode_nodes(clips)
         z_sig, z_noise = self.decoupler(z)
 
@@ -395,6 +427,8 @@ class SignalNoiseDecoupledModel(nn.Module):
 
 
 def orthogonal_loss(z_sig, z_noise):
+    """Penalize dot products between signal and noise subspace projections."""
+
     dim = min(z_sig.size(-1), z_noise.size(-1))
     if dim <= 0:
         return z_sig.new_tensor(0.0)
@@ -405,12 +439,16 @@ def orthogonal_loss(z_sig, z_noise):
 
 
 def noise_consistency_loss(z_noise, slice_ids=None):
+    """Force same-recording noise projections to approach their bag mean."""
+
     del slice_ids
     mean_noise = z_noise.mean(dim=1, keepdim=True)
     return F.mse_loss(z_noise, mean_noise.expand_as(z_noise))
 
 
 def compute_losses(logits, labels, parts, criterion, lambda_orth: float, lambda_noise_consistency: float):
+    """Compute task, orthogonal, noise-consistency, and weighted total losses."""
+
     task = criterion(logits, labels)
     orth = orthogonal_loss(parts["z_sig"], parts["z_noise"])
     noise_consistency = noise_consistency_loss(parts["z_noise"])
@@ -424,12 +462,16 @@ def compute_losses(logits, labels, parts, criterion, lambda_orth: float, lambda_
 
 
 def softmax_np(logits: np.ndarray) -> np.ndarray:
+    """Numerically stable numpy softmax for saved probabilities."""
+
     shifted = logits - np.max(logits, axis=1, keepdims=True)
     exp = np.exp(shifted)
     return exp / np.sum(exp, axis=1, keepdims=True)
 
 
 def metrics_from_arrays(y_true, y_pred):
+    """Compute recording-level classification metrics from labels and predictions."""
+
     return {
         "ACC": float(accuracy_score(y_true, y_pred)),
         "Macro-F1": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
@@ -441,13 +483,25 @@ def metrics_from_arrays(y_true, y_pred):
     }
 
 
-def run_train_epoch(model, loader, criterion, optimizer, device, lambda_orth, lambda_noise_consistency):
+def run_train_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer,
+    device,
+    lambda_orth,
+    lambda_noise_consistency,
+    grad_clip: float = 5.0,
+):
+    """Train one downstream epoch; skip non-finite loss batches safely."""
+
     model.train()
     model.encoder.encoder.eval()
     totals = {"total": 0.0, "task": 0.0, "orth": 0.0, "noise_consistency": 0.0}
     y_true = []
     logits_all = []
     n = 0
+    skipped_nan = 0
     entropy_vals = []
     delta_vals = []
     for clips, labels, _rids in loader:
@@ -456,7 +510,17 @@ def run_train_epoch(model, loader, criterion, optimizer, device, lambda_orth, la
         optimizer.zero_grad(set_to_none=True)
         logits, parts = model(clips, return_parts=True)
         losses = compute_losses(logits, labels, parts, criterion, lambda_orth, lambda_noise_consistency)
+        if not torch.isfinite(losses["total"]).all():
+            skipped_nan += 1
+            print("Warning: NaN/Inf detected in loss; skipping batch.", flush=True)
+            optimizer.zero_grad(set_to_none=True)
+            continue
         losses["total"].backward()
+        if grad_clip and grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad],
+                max_norm=float(grad_clip),
+            )
         optimizer.step()
 
         batch = int(labels.size(0))
@@ -468,6 +532,25 @@ def run_train_epoch(model, loader, criterion, optimizer, device, lambda_orth, la
         entropy_vals.append(float(model.last_attn_entropy.detach().cpu()))
         delta_vals.append(float(model.last_graph_delta_norm.detach().cpu()))
 
+    if not logits_all:
+        return {
+            "ACC": math.nan,
+            "Macro-F1": math.nan,
+            "Weighted-F1": math.nan,
+            "Precision macro": math.nan,
+            "Precision weighted": math.nan,
+            "Recall macro": math.nan,
+            "Recall weighted": math.nan,
+            "total_loss": math.nan,
+            "task_loss": math.nan,
+            "orth_loss": math.nan,
+            "noise_consistency_loss": math.nan,
+            "attn_entropy": math.nan,
+            "graph_delta_norm": math.nan,
+            "graph_res_scale": float(model.graph_res_scale.detach().cpu()),
+            "skipped_nan_batches": skipped_nan,
+        }
+
     logits_np = torch.cat(logits_all, dim=0).numpy()
     pred_np = logits_np.argmax(axis=1)
     out = metrics_from_arrays(np.asarray(y_true), pred_np)
@@ -476,6 +559,7 @@ def run_train_epoch(model, loader, criterion, optimizer, device, lambda_orth, la
     out["attn_entropy"] = float(np.mean(entropy_vals)) if entropy_vals else math.nan
     out["graph_delta_norm"] = float(np.mean(delta_vals)) if delta_vals else math.nan
     out["graph_res_scale"] = float(model.graph_res_scale.detach().cpu())
+    out["skipped_nan_batches"] = skipped_nan
     return out
 
 
@@ -490,6 +574,8 @@ def collect_multisample_predictions(
     lambda_orth: float,
     lambda_noise_consistency: float,
 ):
+    """Evaluate recording-level predictions with deterministic multi-bag voting."""
+
     model.eval()
     model.encoder.encoder.eval()
     y_true = []
@@ -561,6 +647,8 @@ def collect_multisample_predictions(
 
 
 def write_matrix_csv(path: Path, matrix: np.ndarray, class_names):
+    """Save a labeled confusion matrix CSV."""
+
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["true\\pred", *class_names])
@@ -569,6 +657,8 @@ def write_matrix_csv(path: Path, matrix: np.ndarray, class_names):
 
 
 def plot_confusion(path: Path, matrix: np.ndarray, class_names, normalized: bool):
+    """Render a publication-readable confusion matrix using matplotlib only."""
+
     fig, ax = plt.subplots(figsize=(max(6, len(class_names) * 1.4), max(5, len(class_names) * 1.2)))
     im = ax.imshow(matrix, cmap="Blues", interpolation="nearest")
     fig.colorbar(im, ax=ax)
@@ -594,6 +684,8 @@ def plot_confusion(path: Path, matrix: np.ndarray, class_names, normalized: bool
 
 
 def save_confusion_outputs(out_dir: Path, y_true, y_pred, class_names):
+    """Save raw-count and row-normalized confusion matrices as PNG and CSV."""
+
     labels = list(range(len(class_names)))
     counts = confusion_matrix(y_true, y_pred, labels=labels)
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -606,6 +698,8 @@ def save_confusion_outputs(out_dir: Path, y_true, y_pred, class_names):
 
 
 def save_predictions(out_dir: Path, metrics: dict, class_names):
+    """Save recording-level labels, logits, probabilities, and report files."""
+
     np.save(out_dir / "y_true.npy", metrics["y_true"])
     np.save(out_dir / "y_pred.npy", metrics["y_pred"])
     np.save(out_dir / "y_logits.npy", metrics["y_logits"])
@@ -647,6 +741,8 @@ def save_predictions(out_dir: Path, metrics: dict, class_names):
 
 
 def save_loss_curves(out_dir: Path, rows, encoder_ckpt: Path):
+    """Save downstream loss/F1 curves or a clear missing-curve note."""
+
     if rows:
         with (out_dir / "epoch_metrics.csv").open("w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
@@ -711,6 +807,8 @@ def save_loss_curves(out_dir: Path, rows, encoder_ckpt: Path):
 
 
 def count_params(model):
+    """Count total, trainable, frozen, encoder, and downstream head parameters."""
+
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     encoder_params = sum(p.numel() for p in model.encoder.parameters())
@@ -724,6 +822,8 @@ def count_params(model):
 
 
 def format_big_number(value: Optional[int]):
+    """Format large operation counts for metrics files."""
+
     if value is None:
         return None
     if value >= 1_000_000:
@@ -734,6 +834,8 @@ def format_big_number(value: Optional[int]):
 
 
 def count_macs_hooks(model, dummy_input):
+    """Fallback Conv2d/Linear MAC counter based on forward hooks."""
+
     hooks = []
     macs = {"total": 0}
 
@@ -772,17 +874,35 @@ def count_macs_hooks(model, dummy_input):
     return int(macs["total"])
 
 
+def count_macs_fvcore(model, dummy_input):
+    """Try fvcore FlopCountAnalysis and treat reported FLOPs as MAC-like ops."""
+
+    try:
+        from fvcore.nn import FlopCountAnalysis
+    except Exception as exc:
+        raise RuntimeError(f"fvcore unavailable: {exc}") from exc
+    analysis = FlopCountAnalysis(model, dummy_input)
+    return int(analysis.total())
+
+
 def compute_complexity(model, dataset, device):
+    """Compute MACs from a real cached sample, preferring fvcore when available."""
+
     try:
         clips, _label, _rid = dataset.get_eval_item(0, 0, 1)
         dummy = clips.unsqueeze(0).to(device)
-        macs = count_macs_hooks(model, dummy)
+        try:
+            macs = count_macs_fvcore(model, dummy)
+            method = "fvcore_flop_count_analysis"
+        except Exception as fvcore_exc:
+            macs = count_macs_hooks(model, dummy)
+            method = f"conv_linear_forward_hooks (fvcore fallback: {fvcore_exc})"
         return {
             "macs_available": True,
             "input_shape": list(dummy.shape),
             "macs": int(macs),
             "macs_formatted": format_big_number(int(macs)),
-            "macs_method": "conv_linear_forward_hooks",
+            "macs_method": method,
         }
     except Exception as exc:
         return {
@@ -795,6 +915,8 @@ def compute_complexity(model, dataset, device):
 
 
 def save_param_outputs(out_dir: Path, param_summary: dict, complexity: dict):
+    """Save parameter and complexity summaries in txt/json/csv formats."""
+
     write_json(out_dir / "params_summary.json", param_summary)
     write_json(out_dir / "complexity_summary.json", complexity)
     with (out_dir / "params_summary.csv").open("w", encoding="utf-8", newline="") as f:
@@ -813,6 +935,8 @@ def save_param_outputs(out_dir: Path, param_summary: dict, complexity: dict):
 
 
 def write_metrics_txt(path: Path, metrics: dict):
+    """Save a flat metrics dictionary as human-readable text."""
+
     with path.open("w", encoding="utf-8") as f:
         for key, value in metrics.items():
             if isinstance(value, (list, dict)):
@@ -822,12 +946,16 @@ def write_metrics_txt(path: Path, metrics: dict):
 
 
 def save_split_outputs(out_dir: Path, pred_metrics: dict, class_names):
+    """Save all per-split prediction and confusion-matrix artifacts."""
+
     out_dir.mkdir(parents=True, exist_ok=True)
     save_confusion_outputs(out_dir, pred_metrics["y_true"], pred_metrics["y_pred"], class_names)
     save_predictions(out_dir, pred_metrics, class_names)
 
 
 def load_head_checkpoint(model, ckpt_path: Path, out_dir: Path, device):
+    """Load a downstream checkpoint and record strict-load warnings."""
+
     checkpoint = torch_load(ckpt_path, map_location=device)
     state = checkpoint.get("model_state") if isinstance(checkpoint, dict) else checkpoint
     if state is None:
@@ -852,6 +980,8 @@ def load_head_checkpoint(model, ckpt_path: Path, out_dir: Path, device):
 
 
 def seed_from_path_or_checkpoint(path: Path, checkpoint: dict):
+    """Extract a stable seed identifier from checkpoint args or path text."""
+
     args = checkpoint_args(checkpoint)
     if "training_seed" in args:
         return str(args["training_seed"])
@@ -864,6 +994,8 @@ def seed_from_path_or_checkpoint(path: Path, checkpoint: dict):
 
 
 def run_one(encoder_ckpt: Path, args, output_dir: Path, root: Path):
+    """Run one seed in either train-then-evaluate mode or eval-only mode."""
+
     output_dir.mkdir(parents=True, exist_ok=True)
     encoder_payload = torch_load(encoder_ckpt, map_location="cpu")
     model_config_path = infer_model_config(encoder_ckpt, root, args.model_config)
@@ -917,11 +1049,6 @@ def run_one(encoder_ckpt: Path, args, output_dir: Path, root: Path):
         param.requires_grad = False
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
     best_path = output_dir / "best_signal_noise_decoupled.pt"
     epoch_rows = []
     best_val = -1.0
@@ -929,13 +1056,26 @@ def run_one(encoder_ckpt: Path, args, output_dir: Path, root: Path):
     stale = 0
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen_params = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+    mode = "eval" if args.eval_only else args.mode
 
-    if args.head_ckpt:
+    if mode == "eval":
+        if not args.head_ckpt:
+            raise ValueError("--mode eval requires --head_ckpt")
         load_head_checkpoint(model, resolve_path(args.head_ckpt, root), output_dir, device)
-        print(f"Loaded downstream checkpoint: {args.head_ckpt}", flush=True)
-    elif args.eval_only:
-        raise ValueError("--eval_only requires --head_ckpt")
+        best_path = resolve_path(args.head_ckpt, root)
+        if isinstance(head_payload, dict):
+            best_val = float(head_payload.get("best_val_macro_f1", best_val))
+            best_epoch = int(head_payload.get("epoch", best_epoch))
+        print(f"Mode: eval. Loaded downstream checkpoint: {args.head_ckpt}", flush=True)
     else:
+        optimizer = torch.optim.Adam(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+        if args.head_ckpt:
+            load_head_checkpoint(model, resolve_path(args.head_ckpt, root), output_dir, device)
+            print(f"Mode: train. Warm-started downstream checkpoint: {args.head_ckpt}", flush=True)
         print(f"Loaded frozen encoder: {encoder_ckpt}", flush=True)
         print(f"Model config: {model_config_path}", flush=True)
         print(f"Recordings train/val/test: {len(train_set)}/{len(val_set)}/{len(test_set)}", flush=True)
@@ -950,6 +1090,7 @@ def run_one(encoder_ckpt: Path, args, output_dir: Path, root: Path):
                 device,
                 args.lambda_orth,
                 args.lambda_noise_consistency,
+                grad_clip=args.grad_clip,
             )
             val_metrics = collect_multisample_predictions(
                 model,
@@ -969,6 +1110,7 @@ def run_one(encoder_ckpt: Path, args, output_dir: Path, root: Path):
                 "train_noise_consistency_loss": train_metrics["noise_consistency_loss"],
                 "train_acc": train_metrics["ACC"],
                 "train_macro_f1": train_metrics["Macro-F1"],
+                "train_skipped_nan_batches": train_metrics.get("skipped_nan_batches", 0),
                 "val_total_loss": val_metrics["total_loss"],
                 "val_task_loss": val_metrics["task_loss"],
                 "val_orth_loss": val_metrics["orth_loss"],
@@ -988,7 +1130,7 @@ def run_one(encoder_ckpt: Path, args, output_dir: Path, root: Path):
                 f"attn={row['attn_entropy']:.6f},delta={row['graph_delta_norm']:.6f}",
                 flush=True,
             )
-            if val_metrics["Macro-F1"] > best_val:
+            if math.isfinite(val_metrics["Macro-F1"]) and val_metrics["Macro-F1"] > best_val:
                 best_val = val_metrics["Macro-F1"]
                 best_epoch = epoch
                 stale = 0
@@ -1060,6 +1202,7 @@ def run_one(encoder_ckpt: Path, args, output_dir: Path, root: Path):
         payload = {
             "split": split_name,
             "head_type": "signal_noise_decoupled",
+            "mode": mode,
             "encoder_ckpt": str(encoder_ckpt),
             "head_ckpt": str(resolve_path(args.head_ckpt, root)) if args.head_ckpt else str(best_path),
             "model_config": str(model_config_path),
@@ -1074,6 +1217,7 @@ def run_one(encoder_ckpt: Path, args, output_dir: Path, root: Path):
             "graph_k": graph_k,
             "edge_mode": edge_mode,
             "dropout": dropout,
+            "grad_clip": args.grad_clip,
             f"{prefix}_loss": pred_metrics["total_loss"],
             f"{prefix}_task_loss": pred_metrics["task_loss"],
             f"{prefix}_orth_loss": pred_metrics["orth_loss"],
@@ -1138,6 +1282,8 @@ def run_one(encoder_ckpt: Path, args, output_dir: Path, root: Path):
 
 
 def write_multiseed_summary(output_dir: Path, summaries):
+    """Save aggregate metrics for multi-seed runs."""
+
     if len(summaries) <= 1:
         return
     write_json(output_dir / "multiseed_summary.json", {"runs": summaries})
@@ -1148,9 +1294,12 @@ def write_multiseed_summary(output_dir: Path, summaries):
 
 
 def parse_args():
+    """Parse CLI arguments for train/eval signal-noise decoupled runs."""
+
     parser = argparse.ArgumentParser(description="Train/evaluate Orthogonal Signal-Noise Decoupling aggregation.")
     parser.add_argument("--encoder_ckpt", required=True, help="First-stage ShuffleFAC best.pt path, glob, comma list, or directory.")
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--mode", choices=["train", "eval"], default="train", help="train: optimize downstream modules then evaluate; eval: load --head_ckpt and only evaluate.")
     parser.add_argument("--split", choices=["val", "test", "both"], default="test")
     parser.add_argument("--sig_dim", type=int, default=32)
     parser.add_argument("--noise_dim", type=int, default=32)
@@ -1162,12 +1311,13 @@ def parse_args():
     parser.add_argument("--dataset", choices=["DeepShip", "ShipsEar", "auto"], default="auto")
     parser.add_argument("--model_config", default="auto", help="model_config.json path or auto to use encoder_ckpt parent.")
     parser.add_argument("--head_ckpt", default=None, help="Optional trained signal-noise-decoupled checkpoint for eval-only/resume evaluation.")
-    parser.add_argument("--eval_only", action="store_true")
+    parser.add_argument("--eval_only", action="store_true", help="Deprecated alias for --mode eval.")
     parser.add_argument("--clips_per_recording", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--grad_clip", type=float, default=5.0, help="Clip downstream gradients; <=0 disables clipping.")
     parser.add_argument("--dropout", type=float, default=None)
     parser.add_argument("--graph_k", type=int, default=None)
     parser.add_argument("--edge_mode", choices=["temporal", "similarity", "temporal_similarity"], default=None)
@@ -1177,6 +1327,8 @@ def parse_args():
 
 
 def main():
+    """Entry point: expand seeds, run each seed, and write a summary."""
+
     args = parse_args()
     root = Path.cwd()
     output_dir = resolve_path(args.output_dir, root)
