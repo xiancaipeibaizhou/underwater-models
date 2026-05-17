@@ -154,6 +154,12 @@ def pick(cli_value, checkpoint_args_dict: dict, name: str, default):
     return default
 
 
+def cli_arg_was_passed(name: str) -> bool:
+    """Return whether a CLI option was explicitly provided."""
+
+    return any(arg == name or arg.startswith(f"{name}=") for arg in sys.argv[1:])
+
+
 def infer_model_config(encoder_ckpt: Path, root: Path, model_config_arg: str) -> Path:
     """Locate the first-stage model_config.json that stores recording cache paths."""
 
@@ -278,11 +284,14 @@ class NoiseGraphAttentionHead(nn.Module):
         noise_dim: int,
         graph_k: int = 2,
         edge_mode: str = "temporal_similarity",
+        sim_threshold: float = 0.8,
+        use_temperature: bool = False,
         dropout: float = 0.1,
     ):
         super().__init__()
         self.graph_k = int(graph_k)
         self.edge_mode = edge_mode
+        self.sim_threshold = float(sim_threshold)
         self.graph_conv = NoiseGraphConv(noise_dim=noise_dim, dropout=dropout)
         self.graph_res_scale = nn.Parameter(torch.tensor(0.1))
         self.noise_attn = nn.Sequential(
@@ -291,8 +300,11 @@ class NoiseGraphAttentionHead(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(max(noise_dim // 2, 1), 1),
         )
+        if use_temperature:
+            self.temperature = nn.Parameter(torch.tensor(1.0))
         self.last_attn_entropy = torch.tensor(0.0)
         self.last_graph_delta_norm = torch.tensor(0.0)
+        self.last_avg_graph_degree = torch.tensor(0.0)
 
     def _build_graph(self, z_noise):
         b, s, _ = z_noise.shape
@@ -300,13 +312,19 @@ class NoiseGraphAttentionHead(nn.Module):
             return torch.zeros((b, s, 1), dtype=torch.long, device=z_noise.device)
 
         adj = torch.zeros((b, s, s), dtype=torch.bool, device=z_noise.device)
-        if self.edge_mode in ("temporal", "temporal_similarity"):
+        if self.edge_mode in ("temporal", "temporal_similarity", "threshold_similarity"):
             for i in range(s):
                 if i > 0:
                     adj[:, i, i - 1] = True
                 if i + 1 < s:
                     adj[:, i, i + 1] = True
-        if self.edge_mode in ("similarity", "temporal_similarity"):
+        if self.edge_mode == "threshold_similarity":
+            normed = F.normalize(z_noise, p=2, dim=-1)
+            sim = torch.bmm(normed, normed.transpose(1, 2))
+            eye = torch.eye(s, dtype=torch.bool, device=z_noise.device).unsqueeze(0)
+            sim = sim.masked_fill(eye, -float("inf"))
+            adj = adj | (sim > self.sim_threshold)
+        elif self.edge_mode in ("similarity", "temporal_similarity"):
             k = min(self.graph_k, s - 1)
             normed = F.normalize(z_noise, p=2, dim=-1)
             sim = torch.bmm(normed, normed.transpose(1, 2))
@@ -315,6 +333,7 @@ class NoiseGraphAttentionHead(nn.Module):
             sim_idx = sim.topk(k=k, dim=-1).indices
             adj.scatter_(2, sim_idx, True)
 
+        self.last_avg_graph_degree = adj.sum(dim=-1).float().mean().detach()
         max_degree = max(int(adj.sum(dim=-1).max().item()), 1)
         out = torch.zeros((b, s, max_degree), dtype=torch.long, device=z_noise.device)
         for bi in range(b):
@@ -330,6 +349,7 @@ class NoiseGraphAttentionHead(nn.Module):
     def forward(self, z_noise):
         if z_noise.size(1) <= 1:
             smoothed = z_noise
+            self.last_avg_graph_degree = z_noise.new_tensor(0.0).detach()
         else:
             knn_idx = self._build_graph(z_noise)
             update = self.graph_conv(z_noise, knn_idx)
@@ -337,7 +357,11 @@ class NoiseGraphAttentionHead(nn.Module):
         self.last_graph_delta_norm = (smoothed - z_noise).norm(dim=-1).mean().detach()
 
         scores = self.noise_attn(smoothed)
-        weights = torch.softmax(scores, dim=1)
+        if hasattr(self, "temperature"):
+            clamped_temp = torch.clamp(self.temperature, min=0.1)
+            weights = torch.softmax(scores / clamped_temp, dim=1)
+        else:
+            weights = torch.softmax(scores, dim=1)
         entropy = -(weights * (weights + 1e-8).log()).sum(dim=1).mean()
         self.last_attn_entropy = entropy.detach()
         global_noise = (weights * smoothed).sum(dim=1)
@@ -355,15 +379,26 @@ class SignalNoiseDecoupledModel(nn.Module):
         noise_dim: int = 32,
         graph_k: int = 2,
         edge_mode: str = "temporal_similarity",
+        sim_threshold: float = 0.8,
+        use_temperature: bool = False,
+        signal_top_k: int = 0,
+        topk_warmup_epochs: int = 0,
         dropout: float = 0.1,
     ):
         super().__init__()
         self.encoder = encoder
+        self.use_temperature = bool(use_temperature)
+        self.sim_threshold = float(sim_threshold)
+        self.signal_top_k = int(signal_top_k)
+        self.topk_warmup_epochs = int(topk_warmup_epochs)
+        self.current_epoch = 0
         self.decoupler = SignalNoiseDecoupler(encoder.embed_dim, sig_dim, noise_dim, dropout=dropout)
         self.noise_graph = NoiseGraphAttentionHead(
             noise_dim=noise_dim,
             graph_k=graph_k,
             edge_mode=edge_mode,
+            sim_threshold=sim_threshold,
+            use_temperature=use_temperature,
             dropout=dropout,
         )
         self.noise_to_suppression = nn.Sequential(
@@ -378,8 +413,12 @@ class SignalNoiseDecoupledModel(nn.Module):
             nn.Linear(max(sig_dim // 2, 1), 1),
         )
         self.classifier = nn.Sequential(nn.Dropout(dropout), nn.Linear(sig_dim, num_classes))
+        if use_temperature:
+            self.temperature = nn.Parameter(torch.tensor(1.0))
         self.last_attn_entropy = torch.tensor(0.0)
         self.last_graph_delta_norm = torch.tensor(0.0)
+        self.last_avg_graph_degree = torch.tensor(0.0)
+        self.last_signal_topk_count = torch.tensor(0.0)
         self.graph_res_scale = self.noise_graph.graph_res_scale
 
         for param in self.encoder.parameters():
@@ -394,6 +433,41 @@ class SignalNoiseDecoupledModel(nn.Module):
             emb = self.encoder(flat).view(b, s, -1)
         return emb.detach()
 
+    def topk_masked_softmax(self, signal_scores):
+        """Apply optional Top-K sparse signal evidence pooling before softmax."""
+
+        s = signal_scores.size(1)
+        apply_topk = False
+        if hasattr(self, "signal_top_k") and self.signal_top_k > 0 and s > 1:
+            apply_topk = True
+            if (
+                self.training
+                and hasattr(self, "current_epoch")
+                and getattr(self, "current_epoch", 1) <= getattr(self, "topk_warmup_epochs", 0)
+            ):
+                apply_topk = False
+
+        if apply_topk:
+            k = min(self.signal_top_k, s)
+            scores_2d = signal_scores.squeeze(-1)
+            topk_idx = scores_2d.topk(k=k, dim=1).indices
+            mask_2d = torch.zeros_like(scores_2d, dtype=torch.bool)
+            mask_2d.scatter_(1, topk_idx, True)
+            min_val = torch.finfo(signal_scores.dtype).min
+            masked_scores = signal_scores.masked_fill(~mask_2d.unsqueeze(-1), min_val)
+            signal_topk_mask = mask_2d
+        else:
+            masked_scores = signal_scores
+            signal_topk_mask = torch.ones_like(signal_scores.squeeze(-1), dtype=torch.bool)
+
+        if hasattr(self, "temperature"):
+            clamped_temp = torch.clamp(self.temperature, min=0.1)
+            signal_weights = torch.softmax(masked_scores / clamped_temp, dim=1)
+        else:
+            signal_weights = torch.softmax(masked_scores, dim=1)
+
+        return signal_weights, signal_topk_mask
+
     def forward(self, clips, return_parts: bool = False):
         """Classify a recording bag after noise-conditioned signal masking."""
 
@@ -405,10 +479,12 @@ class SignalNoiseDecoupledModel(nn.Module):
         z_sig_filtered = z_sig * (1.0 - suppression)
 
         signal_scores = self.signal_attn(z_sig_filtered)
-        signal_weights = torch.softmax(signal_scores, dim=1)
+        signal_weights, signal_topk_mask = self.topk_masked_softmax(signal_scores)
         entropy = -(signal_weights * (signal_weights + 1e-8).log()).sum(dim=1).mean()
         self.last_attn_entropy = entropy.detach()
         self.last_graph_delta_norm = self.noise_graph.last_graph_delta_norm.detach()
+        self.last_avg_graph_degree = self.noise_graph.last_avg_graph_degree.detach()
+        self.last_signal_topk_count = signal_topk_mask.float().sum(dim=1).mean().detach()
 
         recording_signal = (signal_weights * z_sig_filtered).sum(dim=1)
         logits = self.classifier(recording_signal)
@@ -422,6 +498,7 @@ class SignalNoiseDecoupledModel(nn.Module):
             "global_noise": global_noise,
             "suppression": suppression.squeeze(1),
             "signal_weights": signal_weights,
+            "signal_topk_mask": signal_topk_mask,
             "noise_weights": noise_weights,
         }
 
@@ -504,6 +581,8 @@ def run_train_epoch(
     skipped_nan = 0
     entropy_vals = []
     delta_vals = []
+    degree_vals = []
+    topk_count_vals = []
     for clips, labels, _rids in loader:
         clips = clips.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
@@ -531,9 +610,11 @@ def run_train_epoch(
         logits_all.append(logits.detach().cpu())
         entropy_vals.append(float(model.last_attn_entropy.detach().cpu()))
         delta_vals.append(float(model.last_graph_delta_norm.detach().cpu()))
+        degree_vals.append(float(model.last_avg_graph_degree.detach().cpu()))
+        topk_count_vals.append(float(model.last_signal_topk_count.detach().cpu()))
 
     if not logits_all:
-        return {
+        out = {
             "ACC": math.nan,
             "Macro-F1": math.nan,
             "Weighted-F1": math.nan,
@@ -547,9 +628,14 @@ def run_train_epoch(
             "noise_consistency_loss": math.nan,
             "attn_entropy": math.nan,
             "graph_delta_norm": math.nan,
+            "avg_graph_degree": math.nan,
+            "avg_signal_topk_count": math.nan,
             "graph_res_scale": float(model.graph_res_scale.detach().cpu()),
             "skipped_nan_batches": skipped_nan,
         }
+        if hasattr(model, "temperature"):
+            out["learned_temperature"] = float(model.temperature.detach().cpu())
+        return out
 
     logits_np = torch.cat(logits_all, dim=0).numpy()
     pred_np = logits_np.argmax(axis=1)
@@ -558,7 +644,11 @@ def run_train_epoch(
         out[f"{key}_loss"] = totals[key] / max(n, 1)
     out["attn_entropy"] = float(np.mean(entropy_vals)) if entropy_vals else math.nan
     out["graph_delta_norm"] = float(np.mean(delta_vals)) if delta_vals else math.nan
+    out["avg_graph_degree"] = float(np.mean(degree_vals)) if degree_vals else math.nan
+    out["avg_signal_topk_count"] = float(np.mean(topk_count_vals)) if topk_count_vals else math.nan
     out["graph_res_scale"] = float(model.graph_res_scale.detach().cpu())
+    if hasattr(model, "temperature"):
+        out["learned_temperature"] = float(model.temperature.detach().cpu())
     out["skipped_nan_batches"] = skipped_nan
     return out
 
@@ -577,6 +667,7 @@ def collect_multisample_predictions(
     """Evaluate recording-level predictions with deterministic multi-bag voting."""
 
     model.eval()
+    model.current_epoch = 99999
     model.encoder.encoder.eval()
     y_true = []
     logits_all = []
@@ -584,6 +675,8 @@ def collect_multisample_predictions(
     totals = {"total": 0.0, "task": 0.0, "orth": 0.0, "noise_consistency": 0.0}
     entropy_vals = []
     delta_vals = []
+    degree_vals = []
+    topk_count_vals = []
     n = 0
 
     for start in range(0, len(dataset), batch_size):
@@ -596,6 +689,8 @@ def collect_multisample_predictions(
         sample_noise = []
         sample_entropy = []
         sample_delta = []
+        sample_degree = []
+        sample_topk_count = []
         for sample_id in range(eval_samples):
             clips = torch.stack(
                 [dataset.get_eval_item(i, sample_id, eval_samples)[0] for i in indices],
@@ -607,6 +702,8 @@ def collect_multisample_predictions(
             sample_noise.append(noise_consistency_loss(parts["z_noise"]).detach())
             sample_entropy.append(float(model.last_attn_entropy.detach().cpu()))
             sample_delta.append(float(model.last_graph_delta_norm.detach().cpu()))
+            sample_degree.append(float(model.last_avg_graph_degree.detach().cpu()))
+            sample_topk_count.append(float(model.last_signal_topk_count.detach().cpu()))
 
         logits = torch.stack(sample_logits, dim=0).mean(dim=0)
         task = criterion(logits, labels)
@@ -625,6 +722,8 @@ def collect_multisample_predictions(
         recording_ids.extend(rids)
         entropy_vals.append(float(np.mean(sample_entropy)))
         delta_vals.append(float(np.mean(sample_delta)))
+        degree_vals.append(float(np.mean(sample_degree)))
+        topk_count_vals.append(float(np.mean(sample_topk_count)))
 
     y_true_np = np.asarray(y_true, dtype=np.int64)
     logits_np = torch.cat(logits_all, dim=0).numpy()
@@ -638,8 +737,12 @@ def collect_multisample_predictions(
         "recording_ids": recording_ids,
         "attn_entropy": float(np.mean(entropy_vals)) if entropy_vals else math.nan,
         "graph_delta_norm": float(np.mean(delta_vals)) if delta_vals else math.nan,
+        "avg_graph_degree": float(np.mean(degree_vals)) if degree_vals else math.nan,
+        "avg_signal_topk_count": float(np.mean(topk_count_vals)) if topk_count_vals else math.nan,
         "graph_res_scale": float(model.graph_res_scale.detach().cpu()),
     }
+    if hasattr(model, "temperature"):
+        out["learned_temperature"] = float(model.temperature.detach().cpu())
     out.update(metrics_from_arrays(y_true_np, pred_np))
     for key in totals:
         out[f"{key}_loss"] = totals[key] / max(n, 1)
@@ -1009,6 +1112,23 @@ def run_one(encoder_ckpt: Path, args, output_dir: Path, root: Path):
     seed = int(pick(args.seed, head_args, "seed", checkpoint_args(encoder_payload).get("training_seed", 42)))
     graph_k = int(pick(args.graph_k, head_args, "graph_k", 2))
     edge_mode = str(pick(args.edge_mode, head_args, "edge_mode", "temporal_similarity"))
+    if not cli_arg_was_passed("--sim_threshold") and isinstance(head_args, dict) and head_args.get("sim_threshold") is not None:
+        sim_threshold = float(head_args["sim_threshold"])
+    else:
+        sim_threshold = float(args.sim_threshold)
+    use_temperature = bool(pick(args.use_temperature, head_args, "use_temperature", False))
+    if not cli_arg_was_passed("--signal_top_k") and isinstance(head_args, dict) and head_args.get("signal_top_k") is not None:
+        signal_top_k = int(head_args["signal_top_k"])
+    else:
+        signal_top_k = int(args.signal_top_k)
+    if (
+        not cli_arg_was_passed("--topk_warmup_epochs")
+        and isinstance(head_args, dict)
+        and head_args.get("topk_warmup_epochs") is not None
+    ):
+        topk_warmup_epochs = int(head_args["topk_warmup_epochs"])
+    else:
+        topk_warmup_epochs = int(args.topk_warmup_epochs)
     dropout = float(pick(args.dropout, head_args, "dropout", 0.1))
 
     random.seed(seed)
@@ -1043,6 +1163,10 @@ def run_one(encoder_ckpt: Path, args, output_dir: Path, root: Path):
         noise_dim=args.noise_dim,
         graph_k=graph_k,
         edge_mode=edge_mode,
+        sim_threshold=sim_threshold,
+        use_temperature=use_temperature,
+        signal_top_k=signal_top_k,
+        topk_warmup_epochs=topk_warmup_epochs,
         dropout=dropout,
     ).to(device)
     for param in model.encoder.parameters():
@@ -1082,6 +1206,7 @@ def run_one(encoder_ckpt: Path, args, output_dir: Path, root: Path):
         print(f"Downstream trainable params: {trainable_params}", flush=True)
         print(f"Frozen encoder params: {frozen_params}", flush=True)
         for epoch in range(1, args.epochs + 1):
+            model.current_epoch = epoch
             train_metrics = run_train_epoch(
                 model,
                 train_loader,
@@ -1111,6 +1236,7 @@ def run_one(encoder_ckpt: Path, args, output_dir: Path, root: Path):
                 "train_acc": train_metrics["ACC"],
                 "train_macro_f1": train_metrics["Macro-F1"],
                 "train_skipped_nan_batches": train_metrics.get("skipped_nan_batches", 0),
+                "train_avg_signal_topk_count": train_metrics["avg_signal_topk_count"],
                 "val_total_loss": val_metrics["total_loss"],
                 "val_task_loss": val_metrics["task_loss"],
                 "val_orth_loss": val_metrics["orth_loss"],
@@ -1120,14 +1246,21 @@ def run_one(encoder_ckpt: Path, args, output_dir: Path, root: Path):
                 "val_weighted_f1": val_metrics["Weighted-F1"],
                 "attn_entropy": val_metrics["attn_entropy"],
                 "graph_delta_norm": val_metrics["graph_delta_norm"],
+                "avg_graph_degree": val_metrics["avg_graph_degree"],
+                "avg_signal_topk_count": val_metrics["avg_signal_topk_count"],
                 "graph_res_scale": val_metrics["graph_res_scale"],
             }
+            if "learned_temperature" in train_metrics:
+                row["train_learned_temperature"] = train_metrics["learned_temperature"]
+            if "learned_temperature" in val_metrics:
+                row["val_learned_temperature"] = val_metrics["learned_temperature"]
             epoch_rows.append(row)
             print(
                 f"{epoch},{row['train_total_loss']:.6f},{row['val_total_loss']:.6f},"
                 f"{row['val_acc']:.6f},{row['val_macro_f1']:.6f},"
                 f"orth={row['val_orth_loss']:.6f},noise={row['val_noise_consistency_loss']:.6f},"
-                f"attn={row['attn_entropy']:.6f},delta={row['graph_delta_norm']:.6f}",
+                f"attn={row['attn_entropy']:.6f},delta={row['graph_delta_norm']:.6f},"
+                f"degree={row['avg_graph_degree']:.6f},sig_topk={row['avg_signal_topk_count']:.6f}",
                 flush=True,
             )
             if math.isfinite(val_metrics["Macro-F1"]) and val_metrics["Macro-F1"] > best_val:
@@ -1147,6 +1280,10 @@ def run_one(encoder_ckpt: Path, args, output_dir: Path, root: Path):
                             "seed": seed,
                             "graph_k": graph_k,
                             "edge_mode": edge_mode,
+                            "sim_threshold": sim_threshold,
+                            "use_temperature": use_temperature,
+                            "signal_top_k": signal_top_k,
+                            "topk_warmup_epochs": topk_warmup_epochs,
                             "dropout": dropout,
                         },
                         "encoder_ckpt": str(encoder_ckpt),
@@ -1167,7 +1304,20 @@ def run_one(encoder_ckpt: Path, args, output_dir: Path, root: Path):
                     "epoch": 0,
                     "model_state": model.state_dict(),
                     "best_val_macro_f1": best_val,
-                    "args": vars(args),
+                    "args": {
+                        **vars(args),
+                        "batch_size": batch_size,
+                        "eval_samples": eval_samples,
+                        "clips_per_recording": clips_per_recording,
+                        "seed": seed,
+                        "graph_k": graph_k,
+                        "edge_mode": edge_mode,
+                        "sim_threshold": sim_threshold,
+                        "use_temperature": use_temperature,
+                        "signal_top_k": signal_top_k,
+                        "topk_warmup_epochs": topk_warmup_epochs,
+                        "dropout": dropout,
+                    },
                     "encoder_ckpt": str(encoder_ckpt),
                     "model_config": str(model_config_path),
                 },
@@ -1216,6 +1366,10 @@ def run_one(encoder_ckpt: Path, args, output_dir: Path, root: Path):
             "eval_samples": eval_samples,
             "graph_k": graph_k,
             "edge_mode": edge_mode,
+            "sim_threshold": sim_threshold,
+            "use_temperature": use_temperature,
+            "signal_top_k": signal_top_k,
+            "topk_warmup_epochs": topk_warmup_epochs,
             "dropout": dropout,
             "grad_clip": args.grad_clip,
             f"{prefix}_loss": pred_metrics["total_loss"],
@@ -1231,6 +1385,8 @@ def run_one(encoder_ckpt: Path, args, output_dir: Path, root: Path):
             "recall_weighted": pred_metrics["Recall weighted"],
             "attn_entropy": pred_metrics["attn_entropy"],
             "graph_delta_norm": pred_metrics["graph_delta_norm"],
+            "avg_graph_degree": pred_metrics["avg_graph_degree"],
+            "avg_signal_topk_count": pred_metrics["avg_signal_topk_count"],
             "graph_res_scale": pred_metrics["graph_res_scale"],
             **param_summary,
             "macs": complexity.get("macs"),
@@ -1241,6 +1397,8 @@ def run_one(encoder_ckpt: Path, args, output_dir: Path, root: Path):
             "best_val_macro_f1": best_val,
             "best_epoch": best_epoch,
         }
+        if "learned_temperature" in pred_metrics:
+            payload["learned_temperature"] = pred_metrics["learned_temperature"]
         if split_name != "test":
             payload["test_loss"] = None
             payload["test_acc"] = None
@@ -1320,7 +1478,30 @@ def parse_args():
     parser.add_argument("--grad_clip", type=float, default=5.0, help="Clip downstream gradients; <=0 disables clipping.")
     parser.add_argument("--dropout", type=float, default=None)
     parser.add_argument("--graph_k", type=int, default=None)
-    parser.add_argument("--edge_mode", choices=["temporal", "similarity", "temporal_similarity"], default=None)
+    parser.add_argument("--sim_threshold", type=float, default=0.8, help="Cosine similarity threshold for threshold_similarity graph mode.")
+    parser.add_argument(
+        "--edge_mode",
+        choices=["temporal", "similarity", "temporal_similarity", "threshold_similarity"],
+        default=None,
+    )
+    parser.add_argument(
+        "--use_temperature",
+        action="store_true",
+        default=None,
+        help="Enable learnable temperature scaling for noise and signal attention softmax.",
+    )
+    parser.add_argument(
+        "--signal_top_k",
+        type=int,
+        default=0,
+        help="Use Top-K sparse signal evidence pooling; 0 keeps full soft attention.",
+    )
+    parser.add_argument(
+        "--topk_warmup_epochs",
+        type=int,
+        default=0,
+        help="Use full signal soft attention for this many initial training epochs before applying Top-K.",
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=0)
     return parser.parse_args()
