@@ -100,6 +100,34 @@
 | 62 | Signal-Noise decoupled | DeepShip | SN ExpD Warmup5 | 43 | 0.786885 | 0.780818 | 0.786910 | 55,326 | 16,295 | 20.794M | threshold_similarity sim_threshold=0.8, signal_top_k=4, warmup=5; avg graph degree 5.395 |
 | 63 | Signal-Noise decoupled | DeepShip | SN ExpD Warmup5 | 44 | 0.786885 | 0.798967 | 0.786811 | 55,326 | 16,295 | 20.794M | threshold_similarity sim_threshold=0.8, signal_top_k=4, warmup=5; avg graph degree 6.999 |
 
+
+## 表 3：ShipsEar Best Foundation Checkpoint 单 Backbone 消融
+
+本节固定使用 Stage-1 ShipsEar seed 43 checkpoint：`results/ShuffleFAC/0502_External_ShuffleFAC_ShipsEar_gamma16_multiseed_3s_7_1_2/seed_43/best.pt`。这些结果不使用 `seed_*` wildcard，目的是让所有 downstream ETA 消融共享同一个高质量 frozen encoder。
+
+| 实验 | Edge mode | Top-K | Warmup | Test Loss | ACC | Macro-F1 | Weighted-F1 | Avg Graph Degree | Avg Signal Top-K Count | Best Val Macro-F1 | Best Epoch |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Existing seed43 baseline | temporal_similarity | 0 | 0 | 1.087619 | 0.736842 | 0.703333 | 0.716667 | N/A | N/A | 0.904762 | 4 |
+| BestSeed43 ThresholdOnly | threshold_similarity | 0 | 0 | 1.087682 | 0.736842 | 0.703333 | 0.716667 | 6.148958 | 8.000000 | 0.904762 | 4 |
+| BestSeed43 ETA Complete | threshold_similarity | 4 | 0 | 1.110502 | 0.736842 | 0.703333 | 0.716667 | 6.142708 | 4.000000 | 0.893333 | 4 |
+| BestSeed43 ExpD Warmup5 | threshold_similarity | 4 | 5 | 1.041543 | 0.736842 | 0.703333 | 0.716667 | 6.184375 | 4.000000 | 0.893333 | 5 |
+
+观察：固定使用 ShipsEar seed 43 foundation 后，三组 ETA 消融与已有 seed43 baseline 在 ACC、Macro-F1、Weighted-F1 上完全持平。`sim_threshold=0.8` 的图度数约为 6.14-6.18，仍然是高密度图，不是健康稀疏图；Warmup5 的 test loss 最低。
+
+
+## 表 4：ShipsEar Best Foundation Checkpoint 阈值稀疏性 Sweep
+
+本节固定使用 Stage-1 ShipsEar seed 43 checkpoint，并固定 ETA strongest 配置：`edge_mode=threshold_similarity`、`signal_top_k=4`、`topk_warmup_epochs=5`。目标是通过提高 `sim_threshold` 将平均图度数压到健康稀疏区间 1.5-3.5。
+
+| sim_threshold | Test Loss | ACC | Macro-F1 | Weighted-F1 | Avg Graph Degree | In 1.5-3.5? | Best Val Macro-F1 | Best Epoch |
+|---:|---:|---:|---:|---:|---:|---|---:|---:|
+| 0.80 | 1.041543 | 0.736842 | 0.703333 | 0.716667 | 6.184375 | No | 0.893333 | 5 |
+| 0.90 | 1.041598 | 0.736842 | 0.703333 | 0.716667 | 5.352083 | No | 0.893333 | 5 |
+| 0.95 | 1.041650 | 0.736842 | 0.703333 | 0.716667 | 4.258333 | No | 0.893333 | 5 |
+| 0.98 | 1.041630 | 0.736842 | 0.703333 | 0.716667 | 3.195833 | Yes | 0.893333 | 5 |
+
+观察：提高阈值能够单调降低图密度，`sim_threshold=0.98` 首次进入目标健康稀疏区间，同时保持 ACC、Macro-F1、Weighted-F1 不变。当前最适合论文叙事的稀疏图设置是 `0.98`。
+
 ## 关键观察
 
 - DeepShip 上，GraphHead 的 graph_aware_attention 在三 seed 平均 Macro-F1 为 0.772453，和 Stage-1 recording eval 的 0.772940 非常接近，提升不明显。
@@ -110,6 +138,8 @@
 - ExpE Top4 NoWarmup 在 ShipsEar 上平均 Macro-F1 为 0.644615，也低于 Signal-Noise baseline，并且略低于 ExpD；纯 hard Top-K 从第 1 个 epoch 开始启用后没有带来收益。
 - DeepShip 上，Signal-Noise baseline 三 seed 平均 Macro-F1 为 0.779129，略高于 Stage-1 recording eval 的 0.772940；ExpE Top4 NoWarmup 进一步到 0.786350，但 seed 间方差也更大。
 - DeepShip 新增阈值图消融中，`sim_threshold=0.8` 的平均图度数为 6.13-6.49，明显高于目标健康稀疏区间 1.5-3.5，接近 8 clips 下的全连接图；其中 ExpD Warmup5 的 Macro-F1 最高，为 0.800943。
+- 固定 ShipsEar best foundation checkpoint seed43 后，ThresholdOnly、ETA Complete、ExpD Warmup5 三组 downstream 消融的 Macro-F1 都为 0.703333，与已有 seed43 baseline 持平；`sim_threshold=0.8` 的图度数约 6.15，仍然过密。
+- ShipsEar seed43 threshold sweep 表明，将 `sim_threshold` 提高到 0.98 可把 avg graph degree 降到 3.195833，进入目标 1.5-3.5 稀疏区间，且 Macro-F1 保持 0.703333。
 
 ## 文件来源
 
@@ -120,3 +150,5 @@
 - ExpE：`results/ShuffleFAC_SIGNAL_NOISE/ShipsEar_ExpE_Top4_NoWarmup_TempSim/seed*/metrics.json`。
 - DeepShip Signal-Noise：`results/ShuffleFAC_SIGNAL_NOISE/DeepShip_Baseline_TempSim/seed*/metrics.json` 与 `results/ShuffleFAC_SIGNAL_NOISE/DeepShip_ExpE_Top4_NoWarmup/seed*/metrics.json`。
 - DeepShip threshold ablations：`results/ShuffleFAC_SIGNAL_NOISE/DeepShip_ThresholdOnly/seed*/metrics.json`、`results/ShuffleFAC_SIGNAL_NOISE/DeepShip_ETA_Complete/seed*/metrics.json`、`results/ShuffleFAC_SIGNAL_NOISE/DeepShip_ExpD_Warmup5/seed*/metrics.json`。
+- ShipsEar best seed43 ablations：`results/ShuffleFAC_SIGNAL_NOISE/ShipsEar_BestSeed43_ThresholdOnly/metrics.json`、`results/ShuffleFAC_SIGNAL_NOISE/ShipsEar_BestSeed43_ETA_Complete/metrics.json`、`results/ShuffleFAC_SIGNAL_NOISE/ShipsEar_BestSeed43_ExpD_Warmup5/metrics.json`。
+- ShipsEar seed43 threshold sweep：`results/ShuffleFAC_SIGNAL_NOISE/ShipsEar_BestSeed43_ExpD_Warmup5_Thr090/metrics.json`、`results/ShuffleFAC_SIGNAL_NOISE/ShipsEar_BestSeed43_ExpD_Warmup5_Thr095/metrics.json`、`results/ShuffleFAC_SIGNAL_NOISE/ShipsEar_BestSeed43_ExpD_Warmup5_Thr098/metrics.json`。
