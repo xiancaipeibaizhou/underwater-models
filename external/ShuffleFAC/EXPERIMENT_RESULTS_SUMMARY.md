@@ -23,6 +23,9 @@
 | 13 | Signal-Noise decoupled | ShipsEar | SN temperature | Stage-2 trained downstream | 3 | 0.719298 +/- 0.065643 | 0.680159 +/- 0.090150 | 0.692690 +/- 0.081989 | 55,490 | 16,330 | 20.794M | learnable temperature; avg graph degree 3.072 |
 | 14 | Signal-Noise decoupled | ShipsEar | SN threshold + temperature | Stage-2 trained downstream | 3 | 0.719298 +/- 0.065643 | 0.680159 +/- 0.090150 | 0.692690 +/- 0.081989 | 55,490 | 16,330 | 20.794M | threshold_similarity + temperature; avg graph degree 6.211 |
 | 15 | Signal-Noise decoupled | ShipsEar | SN ExpD Top4 Warmup5 | Stage-2 trained downstream | 3 | 0.701754 +/- 0.049622 | 0.649841 +/- 0.070331 | 0.669591 +/- 0.065163 | 55,488 | 16,328 | 20.794M | threshold_similarity, signal_top_k=4, warmup=5; avg graph degree 6.249; avg signal top-k 4.0 |
+| 16 | Signal-Noise decoupled | ShipsEar | SN ExpE Top4 NoWarmup | Stage-2 trained downstream | 3 | 0.701754 +/- 0.024811 | 0.644615 +/- 0.044065 | 0.667521 +/- 0.035805 | 55,488 | 16,328 | 20.794M | temporal_similarity, signal_top_k=4, warmup=0; avg graph degree 3.071; avg signal top-k 4.0 |
+| 17 | Signal-Noise decoupled | DeepShip | SN baseline | Stage-2 trained downstream | 3 | 0.775956 +/- 0.007728 | 0.779129 +/- 0.002623 | 0.776148 +/- 0.006917 | 55,326 | 16,295 | 20.794M | temporal_similarity, full soft attention; avg graph degree 2.980; avg signal top-k 8.0 |
+| 18 | Signal-Noise decoupled | DeepShip | SN ExpE Top4 NoWarmup | Stage-2 trained downstream | 3 | 0.784153 +/- 0.010223 | 0.786350 +/- 0.017095 | 0.784107 +/- 0.010699 | 55,326 | 16,295 | 20.794M | temporal_similarity, signal_top_k=4, warmup=0; avg graph degree 2.981; avg signal top-k 4.0 |
 
 ## 表 2：不同 Seed 明细指标
 
@@ -75,6 +78,15 @@
 | 43 | Signal-Noise decoupled | ShipsEar | SN ExpD Top4 Warmup5 | 42 | 0.631579 | 0.550476 | 0.577444 | 55,488 | 16,328 | 20.794M | threshold_similarity, signal_top_k=4, warmup=5; avg graph degree 6.249; avg signal top-k 4.0 |
 | 44 | Signal-Noise decoupled | ShipsEar | SN ExpD Top4 Warmup5 | 43 | 0.736842 | 0.703333 | 0.716667 | 55,488 | 16,328 | 20.794M | threshold_similarity, signal_top_k=4, warmup=5; avg graph degree 6.249; avg signal top-k 4.0 |
 | 45 | Signal-Noise decoupled | ShipsEar | SN ExpD Top4 Warmup5 | 44 | 0.736842 | 0.695714 | 0.714662 | 55,488 | 16,328 | 20.794M | threshold_similarity, signal_top_k=4, warmup=5; avg graph degree 6.249; avg signal top-k 4.0 |
+| 46 | Signal-Noise decoupled | ShipsEar | SN ExpE Top4 NoWarmup | 42 | 0.684211 | 0.597179 | 0.632389 | 55,488 | 16,328 | 20.794M | temporal_similarity, signal_top_k=4, warmup=0; avg graph degree 3.071; avg signal top-k 4.0 |
+| 47 | Signal-Noise decoupled | ShipsEar | SN ExpE Top4 NoWarmup | 43 | 0.736842 | 0.703333 | 0.716667 | 55,488 | 16,328 | 20.794M | temporal_similarity, signal_top_k=4, warmup=0; avg graph degree 3.071; avg signal top-k 4.0 |
+| 48 | Signal-Noise decoupled | ShipsEar | SN ExpE Top4 NoWarmup | 44 | 0.684211 | 0.633333 | 0.653509 | 55,488 | 16,328 | 20.794M | temporal_similarity, signal_top_k=4, warmup=0; avg graph degree 3.071; avg signal top-k 4.0 |
+| 49 | Signal-Noise decoupled | DeepShip | SN baseline | 42 | 0.770492 | 0.782781 | 0.772036 | 55,326 | 16,295 | 20.794M | temporal_similarity, full soft attention; avg signal top-k 8.0 |
+| 50 | Signal-Noise decoupled | DeepShip | SN baseline | 43 | 0.786885 | 0.777864 | 0.785891 | 55,326 | 16,295 | 20.794M | temporal_similarity, full soft attention; avg signal top-k 8.0 |
+| 51 | Signal-Noise decoupled | DeepShip | SN baseline | 44 | 0.770492 | 0.776741 | 0.770518 | 55,326 | 16,295 | 20.794M | temporal_similarity, full soft attention; avg signal top-k 8.0 |
+| 52 | Signal-Noise decoupled | DeepShip | SN ExpE Top4 NoWarmup | 42 | 0.786885 | 0.803874 | 0.787415 | 55,326 | 16,295 | 20.794M | temporal_similarity, signal_top_k=4, warmup=0; avg signal top-k 4.0 |
+| 53 | Signal-Noise decoupled | DeepShip | SN ExpE Top4 NoWarmup | 43 | 0.795082 | 0.792011 | 0.795239 | 55,326 | 16,295 | 20.794M | temporal_similarity, signal_top_k=4, warmup=0; avg signal top-k 4.0 |
+| 54 | Signal-Noise decoupled | DeepShip | SN ExpE Top4 NoWarmup | 44 | 0.770492 | 0.763165 | 0.769665 | 55,326 | 16,295 | 20.794M | temporal_similarity, signal_top_k=4, warmup=0; avg signal top-k 4.0 |
 
 ## 关键观察
 
@@ -83,6 +95,8 @@
 - ShipsEar 上，Signal-Noise baseline 三 seed 平均 Macro-F1 为 0.680159，略高于 GraphHead graph_aware_attention 的 0.676508，但差距很小。
 - threshold graph、temperature、threshold+temperature 三个消融在 ShipsEar 上与 Signal-Noise baseline 指标完全持平。
 - ExpD Top4 Warmup5 在 ShipsEar 上平均 Macro-F1 为 0.649841，低于 Signal-Noise baseline 的 0.680159，说明 Top-K sparse signal pooling 当前设置没有带来收益。
+- ExpE Top4 NoWarmup 在 ShipsEar 上平均 Macro-F1 为 0.644615，也低于 Signal-Noise baseline，并且略低于 ExpD；纯 hard Top-K 从第 1 个 epoch 开始启用后没有带来收益。
+- DeepShip 上，Signal-Noise baseline 三 seed 平均 Macro-F1 为 0.779129，略高于 Stage-1 recording eval 的 0.772940；ExpE Top4 NoWarmup 进一步到 0.786350，但 seed 间方差也更大。
 
 ## 文件来源
 
@@ -90,3 +104,5 @@
 - GraphHead：`results/ShuffleFAC_GRAPHHEAD/0502_*_seed*_S8_ms5/metrics.txt`。
 - Signal-Noise：`results/ShuffleFAC_SIGNAL_NOISE/*/seed*/metrics.json`。
 - ExpD：`results/ShuffleFAC_SIGNAL_NOISE/ShipsEar_ExpD_Top4_Warmup5_Sim08/seed*/metrics.json`。
+- ExpE：`results/ShuffleFAC_SIGNAL_NOISE/ShipsEar_ExpE_Top4_NoWarmup_TempSim/seed*/metrics.json`。
+- DeepShip Signal-Noise：`results/ShuffleFAC_SIGNAL_NOISE/DeepShip_Baseline_TempSim/seed*/metrics.json` 与 `results/ShuffleFAC_SIGNAL_NOISE/DeepShip_ExpE_Top4_NoWarmup/seed*/metrics.json`。
